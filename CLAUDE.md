@@ -38,6 +38,7 @@ details. The agent does not negotiate, and by default it doesn't take payment or
 | `liteapi_search.py`| LiteAPI rates + Google Places phones/reviews → `find_hotels()` returns `Hotel` objects |
 | `schemas.py`       | pydantic models: `HotelQuery`, `Hotel`, `CallQuery` (transcript, summary, quoted price, available), `RankWeights` |
 | `ranker.py`        | `merge` (de-dupe across sources), `rank` (price × distance × review penalty), `final_rank`/`cheapest` (after the calls: `available is True` only, by quoted price). No API calls |
+| `decider.py`       | Post-call stop rule: price table + band segments + latency cost; says when to stop waiting for the other calls (no I/O) |
 | `tests/integ_pipeline.py` | Pipeline on six demo call transcripts with the real Backboard LLM; search and calls faked |
 | `tests/call_test.py`     | Dials one invented hotel: real call, no SerpApi, no email. Tune the call here         |
 | `README.md`        | Human-facing blueprint, API payloads, setup, checklist                               |
@@ -107,10 +108,10 @@ redial), `unreachable`, `timeout`, `cancelled` (a better option won), `no_phone`
 
 `PUBLIC_URL` (tunnel URL, must be current), `PORT`, `BACKBOARD_API_KEY`, `BACKBOARD_BASE_URL`,
 `BACKBOARD_PROVIDER` (default `cerebras`), `BACKBOARD_MODEL` (default `openai/gpt-oss-120b`),
-`SERPAPI_KEY`, `CALL_BATCH` (3), `MAX_ROUNDS` (3), `RADIUS_KM` (20, from city centre), `SEARCH_PAGES` (1), `GOOGLE_PLACES_KEY` (optional), `CURRENCY=CAD`,
+`SERPAPI_KEY`, `MAX_ROUNDS` (3), `RADIUS_KM` (20, from city centre), `SEARCH_PAGES` (1), `GOOGLE_PLACES_KEY` (optional), `CURRENCY=CAD`,
 `SERP_GL=ca`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM`, `PHONE_OVERRIDE`, `TOP_K`,
 `RECORD_CALLS` (1 = record every call, attach the winner's mp3 to the email), `HOLD_ON_CALL` (1 = accept a hold or reservation if the hotel offers one), `TTS_VOICE`,
-`SPEECH_TIMEOUT`, `BARGE_IN` (0 = the agent is never interrupted), `MAX_TURNS`, `CALL_TIMEOUT`,
+`SPEECH_TIMEOUT`, `BARGE_IN` (0 = the agent is never interrupted), `MAX_TURNS`, `CALL_TIMEOUT` (30 s: later calls are dropped), `CALL_BATCH` (15 calls at once), `LATENCY_COST` (currency per second of waiting, 0.5), `SEGMENT_PCT` (price band width, 0.10),
 `DIAL_RETRIES`, `GUEST_NAME`, `JUDGE_EMAIL`,
 `ELEVEN_API_KEY`, `ELEVEN_VOICE_ID` (default `NOpBlnGInO9m6vDvFkFC`, Spuds Oxley),
 `ELEVEN_MODEL` (default `eleven_flash_v2_5`), `ELEVEN_FORMAT`, `ELEVEN_MODE`, `ELEVEN_TIMEOUT`,
@@ -122,6 +123,7 @@ redial), `unreachable`, `timeout`, `cancelled` (a better option won), `no_phone`
 ```bash
 pip install -r requirements.txt
 .venv/bin/python tests/test-agent.py                         # offline tests, no keys needed
+.venv/bin/python tests/test_decider.py                     # the stop rule, pure arithmetic
 .venv/bin/python tests/integ_pipeline.py                  # demo transcripts through the real LLM (~3 calls, needs BACKBOARD_API_KEY)
 cloudflared tunnel --url http://localhost:8080         # or: ngrok http 8080 → PUBLIC_URL
 .venv/bin/python tests/call_test.py "Good Value Inn" 129      # ONE real call, no search, no email

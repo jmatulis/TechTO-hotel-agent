@@ -80,7 +80,7 @@ EL_TIMEOUT = float(E("ELEVEN_TIMEOUT", "4"))              # past this we fall ba
 SPEECH_TIMEOUT = E("SPEECH_TIMEOUT", "auto")          # "auto" or seconds, e.g. "1"
 BARGE_IN = E("BARGE_IN", "0") == "1"                  # 1 = the hotel can cut the agent off mid-sentence
 MAX_TURNS = int(E("MAX_TURNS", "6"))
-CALL_TIMEOUT = float(E("CALL_TIMEOUT", "120"))        # per call attempt
+CALL_TIMEOUT = float(E("CALL_TIMEOUT", "30"))         # a call still going after this is dropped
 DIAL_RETRIES = int(E("DIAL_RETRIES", "1"))            # redials on busy / no answer
 RECORD_CALLS = E("RECORD_CALLS", "1") == "1"          # Twilio records each call; the winner's mp3 is emailed
 HOLD_ON_CALL = E("HOLD_ON_CALL", "0") == "1"          # 1 -> accept a hold/reservation if offered

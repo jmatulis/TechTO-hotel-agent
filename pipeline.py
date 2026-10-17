@@ -24,6 +24,7 @@ import httpx
 import uvicorn
 
 import agent
+import decider
 import hotel_search as hs
 import liteapi_search as lite
 import ranker
@@ -31,10 +32,14 @@ from schemas import CallQuery, Hotel, HotelQuery
 import mailer
 
 E = agent.E
-BATCH = int(E("CALL_BATCH", "3"))              # hotels phoned per round
+BATCH = int(E("CALL_BATCH", "15"))             # hotels phoned in parallel per round
 MAX_ROUNDS = int(E("MAX_ROUNDS", "3"))         # give up after this many rounds with nobody available
 RADIUS_KM = float(E("RADIUS_KM", "20"))        # only hotels this close to the city centre; 0 = off
 SEARCH_PAGES = int(E("SEARCH_PAGES", "1"))     # google_hotels pages (~20 hotels, 1 credit each)
+POLICY = decider.Policy(latency_cost=float(E("LATENCY_COST", "0.5")),    # currency we'd pay to save 1 s
+                        segment_pct=float(E("SEGMENT_PCT", "0.10")),     # price band width, share of cheapest
+                        deadline_s=agent.CALL_TIMEOUT,
+                        call_s=agent.CALL_TIMEOUT * 2 / 3)               # typical call, until measured
 COUNTRY = E("SERP_GL", "ca").upper()           # ISO-2 for LiteAPI nationality and the Places lookups
 
 
@@ -127,13 +132,63 @@ def candidate(i: int, h: Hotel, nights: int) -> agent.Candidate:
 
 
 # ---------------------------------------------------------------- 3. calls
-async def call_batch(run: agent.Run, batch: list[agent.Candidate]):
-    """Every call runs to the end: the quoted price can reorder the list, so no early stop."""
-    if agent.PHONE_OVERRIDE:                      # one line: one call at a time
-        for c in batch:
-            await agent.call_candidate(run, c)
-    else:
-        await asyncio.gather(*(agent.call_candidate(run, c) for c in batch))
+async def race(run: agent.Run, batch: list[agent.Candidate]) -> agent.Candidate | None:
+    """Phone the whole batch at once and decide as the calls finish, not when the last one does.
+
+    Each call is its own task: it dials (dropped after CALL_TIMEOUT), reads its own transcript, then
+    posts itself on a queue. We take events one at a time, update the price table and ask
+    `decider.Board.decide()` whether another call is still worth waiting for. When it says stop, the
+    calls still ringing are hung up. Returns the winning candidate, or None if nobody confirmed."""
+    key = lambda c: str(c.idx)
+    n = agent.nights(run.req)
+    board = decider.Board([decider.Entry(key(c), c.name, c.total or c.price * n) for c in batch], POLICY)
+    events: asyncio.Queue = asyncio.Queue()
+    gate = asyncio.Semaphore(1 if agent.PHONE_OVERRIDE else len(batch))   # one test line: one call at a time
+    t0 = time.perf_counter()
+    clock = lambda: time.perf_counter() - t0
+
+    async def one(c: agent.Candidate):
+        try:
+            async with gate:
+                board.start(key(c), clock())
+                try:
+                    await asyncio.wait_for(agent.call_candidate(run, c), agent.CALL_TIMEOUT)
+                except asyncio.TimeoutError:
+                    c.status = "timeout"                 # too late: whatever was said is ignored
+            if c.status != "timeout":
+                talked = c.history and c.status != "unavailable"      # a clear "no" needs no second reading
+                facts = await read_calls(run, [c]) if talked else {}
+                apply(run, c, facts.get(c.idx))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[call] {c.name}: {e!r}", file=sys.stderr)
+            c.status = "error"
+        await events.put(c)
+
+    tasks = [asyncio.create_task(one(c)) for c in batch]
+    by_key = {key(c): c for c in batch}
+    decision = decider.Decision(False, None, "")
+    try:
+        while True:
+            try:
+                c = await asyncio.wait_for(events.get(), 1.0)         # a quiet second still re-runs the maths
+                ok = bool(c.call and c.call.available)
+                board.answer(key(c), clock(), ok, c.call.price if ok else None)
+                print(f"[{clock():5.1f}s] {c.name}: {c.status}"
+                      + (f", {c.call.price:.0f} for the stay" if ok and c.call.price is not None else ""),
+                      file=sys.stderr)
+            except asyncio.TimeoutError:
+                pass
+            decision = board.decide(clock())
+            if decision.stop:
+                break
+    finally:
+        for t in tasks:
+            t.cancel()                                    # hangs up whoever is still ringing
+        await asyncio.gather(*tasks, return_exceptions=True)
+    print(board.render(clock()) + f"\n=> {decision.reason}", file=sys.stderr)
+    return by_key.get(decision.winner)
 
 
 # ---------------------------------------------------------------- 4. read the transcripts
@@ -246,15 +301,11 @@ async def run_pipeline(run: agent.Run) -> agent.Candidate | None:
         print(f"round {rnd}: calling " + ", ".join(f"{c.name} ({c.price:.0f})" for c in batch),
               file=sys.stderr)
         await asyncio.gather(*(agent.tts(agent.opener(run, c)) for c in batch))   # pre-build openers
-        await call_batch(run, batch)
-        facts = await read_calls(run, batch)
-        for c in batch:
-            apply(run, c, facts.get(c.idx))
-        best = ranker.cheapest([c.hotel for c in batch])    # confirmed rooms only, cheapest quote first
+        winner = await race(run, batch)
         run.mark(f"round{rnd}")
-        if best:
-            run.winner = next(c for c in batch if c.hotel is best)
-            return run.winner
+        if winner:
+            run.winner = winner
+            return winner
     return None
 
 
