@@ -596,6 +596,7 @@ async def t_race():
     and the 1-minute (here: 0.4 s) cut-off. Times are scaled down; latency_cost scaled up to match."""
     import decider
     import pipeline as pl
+    import ranker
     from schemas import Hotel
 
     # name: (listed stay price, seconds the call takes, does the hotel confirm, quoted stay price)
@@ -614,6 +615,7 @@ async def t_race():
             delay, ok, quote = spec[c.name][1:]
             c.attempts += 1
             c.status = "calling"
+            c.history = [{"role": "user", "content": f"{c.name} picks up"}]       # what is said first
             try:
                 await asyncio.sleep(delay)
             except asyncio.CancelledError:
@@ -657,7 +659,13 @@ async def t_race():
     assert w.name == "Dear" and hung == ["Cheap"], (w.name, hung)
     # C. a cheaper hotel that picks up too late (past the cut-off) is ignored, even if it would say yes
     run, w, took, hung = await run_race({"Late": (100, 0.8, True, 90), "Dear": (200, 0.05, True, 200)})
-    assert w.name == "Dear" and run.cands[0].status in ("timeout", "cancelled") and run.cands[0].call is None
+    late = run.cands[0]
+    assert w.name == "Dear" and late.status == "timeout", (w.name, late.status)
+    # ... but its partial transcript is kept, flagged as cut off, and it can never win
+    assert late.call.available is None and late.call.price is None, late.call
+    assert "Late picks up" in late.call.transcript and "cut off after 0.4 s" in late.call.summary, late.call
+    assert late.hotel.call_query is late.call
+    assert ranker.cheapest([c.hotel for c in run.cands]).name == "Dear"
     # D. nobody confirms: None, and every call was read or skipped without a crash
     run, w, took, hung = await run_race({"A": (100, 0.02, False, None), "B": (110, 0.03, False, None)})
     assert w is None

@@ -81,7 +81,7 @@ EL_TIMEOUT = float(E("ELEVEN_TIMEOUT", "4"))              # past this we fall ba
 SPEECH_TIMEOUT = E("SPEECH_TIMEOUT", "auto")          # "auto" or seconds, e.g. "1"
 BARGE_IN = E("BARGE_IN", "0") == "1"                  # 1 = the hotel can cut the agent off mid-sentence
 MAX_TURNS = int(E("MAX_TURNS", "6"))
-CALL_TIMEOUT = float(E("CALL_TIMEOUT", "30"))         # a call still going after this is dropped
+CALL_TIMEOUT = float(E("CALL_TIMEOUT", "45"))         # a call still going after this is dropped
 CALL_MAX_SECONDS = int(E("CALL_MAX_SECONDS", "60"))   # Twilio hangs up after this long connected
 BYE = "Perfect, thanks. Goodbye."                     # fixed: its TTS is built once, reused every call
 DIAL_RETRIES = int(E("DIAL_RETRIES", "1"))            # redials on busy / no answer
