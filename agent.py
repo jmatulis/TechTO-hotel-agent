@@ -82,6 +82,7 @@ BARGE_IN = E("BARGE_IN", "0") == "1"                  # 1 = the hotel can cut th
 MAX_TURNS = int(E("MAX_TURNS", "6"))
 CALL_TIMEOUT = float(E("CALL_TIMEOUT", "120"))        # per call attempt
 DIAL_RETRIES = int(E("DIAL_RETRIES", "1"))            # redials on busy / no answer
+RECORD_CALLS = E("RECORD_CALLS", "1") == "1"          # Twilio records each call; the winner's mp3 is emailed
 HOLD_ON_CALL = E("HOLD_ON_CALL", "0") == "1"          # 1 -> accept a hold/reservation if offered
 
 GUEST_NAME = E("GUEST_NAME", "Jordan Fulawka")
@@ -510,10 +511,38 @@ async def place_call(run: Run, c: Candidate) -> str:
         data={"To": PHONE_OVERRIDE or c.phone, "From": TW_FROM,
               "Twiml": await gather(c, opener(run, c)),   # inline: no webhook hop before speaking
               "StatusCallback": f"{PUBLIC_URL}/status?c={c.idx}",
-              "StatusCallbackEvent": "completed", "Timeout": "20"},
+              "StatusCallbackEvent": "completed", "Timeout": "20",
+              **({"Record": "true"} if RECORD_CALLS else {})},
     )
     r.raise_for_status()
     return r.json()["sid"]
+
+
+async def recording_mp3(call_sid: str | None, wait: float = 20.0) -> bytes | None:
+    """The call's recording as mp3 bytes, or None. Twilio finishes processing a few seconds after
+    hangup, so poll until it's 'completed'. Media needs our auth: email the bytes, not the URL."""
+    if not call_sid:
+        return None
+    base = f"https://api.twilio.com/2010-04-01/Accounts/{TW_SID}/Recordings"
+    deadline = time.perf_counter() + wait
+    try:
+        while True:
+            r = await HTTP.get(base + ".json", params={"CallSid": call_sid}, auth=(TW_SID, TW_TOKEN))
+            r.raise_for_status()
+            recs = r.json().get("recordings") or []
+            done = [x for x in recs if x.get("status") == "completed"]
+            if done:
+                m = await HTTP.get(f"{base}/{done[0]['sid']}.mp3", auth=(TW_SID, TW_TOKEN),
+                                   follow_redirects=True, timeout=20)
+                m.raise_for_status()
+                return m.content
+            if (recs and all(x.get("status") in ("failed", "absent") for x in recs)) \
+                    or time.perf_counter() > deadline:
+                return None
+            await asyncio.sleep(1.0)
+    except Exception as e:
+        print(f"[recording] {call_sid}: {e!r}", file=sys.stderr)
+        return None
 
 
 async def hang_up(sid: str | None):

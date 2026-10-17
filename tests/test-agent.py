@@ -629,7 +629,7 @@ async def t_mailer():
         mailer.RESEND_KEY, mailer.MAIL_FROM, mailer.SMTP_USER, mailer.SMTP_PASS = "re_x", "a@b.c", "", ""
         await mailer.send("judge@techto.ca", "S", "T", "<p>H</p>", client=FakeClient())
         mailer.RESEND_KEY, mailer.MAIL_FROM, mailer.SMTP_USER, mailer.SMTP_PASS = "", "", "me@gmail.com", "pw"
-        mailer._smtp = lambda to, s, t, h: sent.append(("smtp", to, s))
+        mailer._smtp = lambda to, s, t, h, att=None: sent.append(("smtp", to, s))
         await mailer.send("judge@techto.ca", "S2", "T", "<p>H</p>")
         assert sent == [("resend", ["judge@techto.ca"], "S"), ("smtp", "judge@techto.ca", "S2")], sent
         mailer.SMTP_PASS = ""
@@ -640,7 +640,127 @@ async def t_mailer():
     print("ok  mailer: organizers' subject, hotel/price/km/transcripts, escaped html, resend + smtp")
 
 
+async def t_recording():
+    """Every call is recorded; only the winner's mp3 is fetched (after Twilio finishes processing)
+    and attached to the email, via Resend (base64) or SMTP (MIME part)."""
+    import base64
+    import mailer
+    import pipeline as pl
+
+    sent_data, gets = [], []
+
+    class R:
+        def __init__(self, j=None, content=b""):
+            self._j, self.content, self.status_code = j, content, 200
+
+        def json(self):
+            return self._j
+
+        def raise_for_status(self):
+            pass
+
+    class FakeHTTP:
+        def __init__(self):
+            self.polls = 0
+
+        async def post(self, url, auth=None, data=None):
+            sent_data.append(data)
+            return R({"sid": "CA1"})
+
+        async def get(self, url, params=None, auth=None, follow_redirects=False, timeout=None):
+            gets.append(url.rsplit("/", 1)[-1])
+            if url.endswith(".mp3"):
+                return R(content=b"ID3fake-mp3")
+            self.polls += 1   # first poll: still processing
+            return R({"recordings": [{"sid": "RE9", "status": "processing" if self.polls == 1 else "completed"}]})
+
+    async def no_tts(text):
+        return None
+
+    saved = (agent.HTTP, agent.RECORD_CALLS, agent.recording_mp3, agent.tts)
+    try:
+        agent.HTTP, agent.tts = FakeHTTP(), no_tts
+        run = fresh()
+        agent.RECORD_CALLS = True
+        await agent.place_call(run, run.cands[0])
+        agent.RECORD_CALLS = False
+        await agent.place_call(run, run.cands[0])
+        assert sent_data[0].get("Record") == "true" and "Record" not in sent_data[1], sent_data
+
+        t0 = asyncio.get_running_loop().time()
+        assert await agent.recording_mp3("CA1") == b"ID3fake-mp3"
+        assert gets == ["Recordings.json", "Recordings.json", "RE9.mp3"], gets
+        assert asyncio.get_running_loop().time() - t0 < 3
+
+        class Empty(FakeHTTP):
+            async def get(self, url, **kw):
+                return R({"recordings": []})
+        agent.HTTP = Empty()
+        assert await agent.recording_mp3("CA2", wait=0.1) is None, "gives up, never blocks the email"
+        assert await agent.recording_mp3(None) is None
+
+        # pipeline: only the winner's call, named after the hotel
+        fetched = []
+
+        async def fake_rec(sid, wait=20.0):
+            fetched.append(sid)
+            return b"mp3!"
+        agent.recording_mp3, agent.RECORD_CALLS = fake_rec, True
+        run.winner = run.cands[1]
+        run.winner.sid = "CAwin"
+        att = await pl.winner_recording(run)
+        assert fetched == ["CAwin"] and att == [("call-Cheap-Dump-2026-10-18.mp3", b"mp3!", "audio/mpeg")], att
+        agent.RECORD_CALLS = False
+        assert await pl.winner_recording(run) == []
+    finally:
+        agent.HTTP, agent.RECORD_CALLS, agent.recording_mp3, agent.tts = saved
+
+    # mailer: attachment reaches both transports
+    saved = (mailer.RESEND_KEY, mailer.MAIL_FROM, mailer.SMTP_USER, mailer.SMTP_PASS, mailer.smtplib.SMTP_SSL)
+    try:
+        posted = []
+
+        class FakeClient:
+            async def post(self, url, headers, json):
+                posted.append(json)
+                return type("R", (), {"raise_for_status": lambda self: None})()
+
+        mailer.RESEND_KEY, mailer.MAIL_FROM = "re_x", "a@b.c"
+        await mailer.send("j@x.ca", "S", "T", "<p>H</p>", client=FakeClient(),
+                          attachments=[("call.mp3", b"mp3!", "audio/mpeg")])
+        assert posted[0]["attachments"] == [{"filename": "call.mp3", "content": base64.b64encode(b"mp3!").decode()}]
+
+        msgs = []
+
+        class FakeSMTP:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def login(self, u, p):
+                pass
+
+            def send_message(self, m):
+                msgs.append(m)
+
+        mailer.smtplib.SMTP_SSL = FakeSMTP
+        mailer.RESEND_KEY, mailer.SMTP_USER, mailer.SMTP_PASS = "", "me@gmail.com", "pw"
+        await mailer.send("j@x.ca", "S", "T", "<p>H</p>", attachments=[("call.mp3", b"mp3!", "audio/mpeg")])
+        parts = [p for p in msgs[0].iter_attachments()]
+        assert [(p.get_filename(), p.get_content_type(), p.get_content()) for p in parts] == \
+            [("call.mp3", "audio/mpeg", b"mp3!")], parts
+    finally:
+        mailer.RESEND_KEY, mailer.MAIL_FROM, mailer.SMTP_USER, mailer.SMTP_PASS, mailer.smtplib.SMTP_SSL = saved
+    print("ok  recording: calls recorded, winner's mp3 polled + fetched, attached via resend and smtp")
+
+
 async def main():
+    await t_recording()
     await t_mailer()
     await t_hotel_search()
     await t_pipeline()

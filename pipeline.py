@@ -324,6 +324,18 @@ def email_items(run: agent.Run) -> tuple[dict, dict | None, list[dict], dict]:
     return {**run.req, "nights": n}, winner, list(items.values()), stats
 
 
+async def winner_recording(run: agent.Run) -> list[tuple[str, bytes, str]]:
+    """The winning call's Twilio recording as an email attachment; [] if off or unavailable."""
+    if not (agent.RECORD_CALLS and run.winner):
+        return []
+    mp3 = await agent.recording_mp3(run.winner.sid)
+    if not mp3:
+        print("[email] winner's recording not available; sending without it", file=sys.stderr)
+        return []
+    safe = "".join(ch if ch.isalnum() else "-" for ch in run.winner.name).strip("-")[:40]
+    return [(f"call-{safe}-{run.req['check_in']}.mp3", mp3, "audio/mpeg")]
+
+
 async def list_only(prompt: str, top: int = 10):
     """Parse + search + phones, print the table, phone nobody."""
     preflight(calling=False)
@@ -372,7 +384,8 @@ async def main(prompt: str):
             print(f"[email] skipped: {problem}", file=sys.stderr)
         else:
             try:
-                await mailer.send(run.req["email"], *mailer.build(*email_items(run)), client=agent.HTTP)
+                await mailer.send(run.req["email"], *mailer.build(*email_items(run)), client=agent.HTTP,
+                                  attachments=await winner_recording(run))
                 run.mark("email")
                 print(f"[email] sent to {run.req['email']}", file=sys.stderr)
             except Exception as e:      # keep the report: the calls already cost money

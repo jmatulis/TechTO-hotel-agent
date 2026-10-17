@@ -14,6 +14,7 @@ Subject follows the organizers' format when TEAM_NUMBER is set:
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import smtplib
 from email.message import EmailMessage
@@ -163,18 +164,23 @@ def build(req: dict, winner: dict | None, options: list[dict], stats: dict | Non
 
 
 # ---------------------------------------------------------------- sending
-def _smtp(to: str, subject: str, text: str, html: str):
+def _smtp(to: str, subject: str, text: str, html: str, attachments: list | None = None):
     msg = EmailMessage()
     msg["From"], msg["To"], msg["Subject"] = MAIL_FROM or SMTP_USER, to, subject
     msg.set_content(text)
     msg.add_alternative(html, subtype="html")
+    for name, data, mime in attachments or []:
+        main, _, sub = mime.partition("/")
+        msg.add_attachment(data, maintype=main, subtype=sub, filename=name)
     with smtplib.SMTP_SSL(SMTP_HOST, 465, timeout=10) as s:
         s.login(SMTP_USER, SMTP_PASS)
         s.send_message(msg)
 
 
-async def send(to: str, subject: str, text: str, html: str, client: httpx.AsyncClient | None = None):
-    """Resend over HTTP when keyed (fast), else Gmail SMTP in a thread (never blocks the loop)."""
+async def send(to: str, subject: str, text: str, html: str, client: httpx.AsyncClient | None = None,
+               attachments: list[tuple[str, bytes, str]] | None = None):
+    """Resend over HTTP when keyed (fast), else Gmail SMTP in a thread (never blocks the loop).
+    attachments: [(filename, bytes, mime type)], e.g. the winning call's mp3."""
     if problem := configured():
         raise RuntimeError(problem)
     if RESEND_KEY:
@@ -184,10 +190,12 @@ async def send(to: str, subject: str, text: str, html: str, client: httpx.AsyncC
             r = await client.post("https://api.resend.com/emails",
                                   headers={"Authorization": f"Bearer {RESEND_KEY}"},
                                   json={"from": MAIL_FROM, "to": [to], "subject": subject,
-                                        "text": text, "html": html})
+                                        "text": text, "html": html,
+                                        **({"attachments": [{"filename": n, "content": base64.b64encode(d).decode()}
+                                                            for n, d, _ in attachments]} if attachments else {})})
             r.raise_for_status()
         finally:
             if own:
                 await client.aclose()
     else:
-        await asyncio.to_thread(_smtp, to, subject, text, html)
+        await asyncio.to_thread(_smtp, to, subject, text, html, attachments)
