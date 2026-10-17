@@ -40,7 +40,7 @@ SEARCH_PAGES = int(E("SEARCH_PAGES", "1"))     # google_hotels pages (~20 hotels
 POLICY = decider.Policy(latency_cost=float(E("LATENCY_COST", "0.5")),    # currency we'd pay to save 1 s
                         segment_pct=float(E("SEGMENT_PCT", "0.10")),     # price band width, share of cheapest
                         deadline_s=agent.CALL_TIMEOUT,
-                        call_s=agent.CALL_TIMEOUT * 2 / 3)               # typical call, until measured
+                        call_s=min(30.0, agent.CALL_TIMEOUT * 2 / 3))    # typical call, until measured
 COUNTRY = E("SERP_GL", "ca").upper()           # ISO-2 for LiteAPI nationality and the Places lookups
 
 

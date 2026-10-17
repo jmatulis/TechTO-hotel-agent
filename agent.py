@@ -88,7 +88,7 @@ LLM_CONCURRENCY = int(E("LLM_CONCURRENCY", "8"))              # simultaneous Bac
 ELEVEN_CONCURRENCY = int(E("ELEVEN_CONCURRENCY", "4"))        # ElevenLabs plans allow 2-15 at once
 EL_SLOT_WAIT = float(E("ELEVEN_SLOT_WAIT", "1.0"))            # no free slot after this long: use Twilio's voice
 TWILIO_CONCURRENCY = int(E("TWILIO_CONCURRENCY", "5"))        # simultaneous call-create requests
-CALL_TIMEOUT = float(E("CALL_TIMEOUT", "45"))         # a call still going after this is dropped
+CALL_TIMEOUT = float(E("CALL_TIMEOUT", "90"))         # a call still going after this is dropped
 CALL_MAX_SECONDS = int(E("CALL_MAX_SECONDS", "60"))   # Twilio hangs up after this long connected
 BYE = "Perfect, thanks. Goodbye."                     # fixed: its TTS is built once, reused every call
 DIAL_RETRIES = int(E("DIAL_RETRIES", "0"))            # redials on busy / no answer; 0 = each hotel is dialed once
