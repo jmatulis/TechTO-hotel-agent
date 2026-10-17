@@ -8,6 +8,7 @@ fields and that the right hotel wins. Costs ~3 LLM calls. Skipped without BACKBO
 
 Round 1 (3 hotels): fully booked / available but wrong dates / voicemail  -> nobody confirmed.
 Round 2 (3 hotels): nightly + tax extra / all-in nightly / a total for both nights -> cheapest stay wins.
+(The race stops early once nobody still ringing can beat the best quote by a price band, see decider.py.)
 """
 from __future__ import annotations
 
@@ -59,7 +60,7 @@ DEMO = {   # name: (listed nightly price, hotel phone, what the front desk says)
         (A, "Thank you. Cancellation?"),
         (H, "Non-refundable at that rate, I'm afraid."),
     ]),
-    "Queen West Inn": (130, "416-555-0106", [
+    "Queen West Inn": (125, "416-555-0106", [
         (H, "Queen West Inn, Dana here."),
         (H, "A king, October eighteenth to twentieth? We have it. I can do two hundred and forty dollars total "
             "for the two nights, all in."),
@@ -124,12 +125,13 @@ async def main():
         assert c.call.available is EXPECT[c.name] or (EXPECT[c.name] is None and not c.call.available), \
             f"{c.name}: expected {EXPECT[c.name]}, got {c.call.available} ({c.call.summary})"
         assert c.call.transcript.startswith("Agent: Hi, this is an automated assistant"), c.name
-    assert {c.name for c in called} == set(DEMO), "all six demo hotels should have been called"
+    assert {"Lakeview Inn", "Harbour Suites", "Maple Motel", "Queen West Inn"} <= {c.name for c in called}, \
+        "round 1 is read in full; in round 2 the race may cut calls once nobody left can win a price band"
     assert winner is not None and winner.name == WINNER, f"winner {winner and winner.name}, wanted {WINNER}"
     assert abs(winner.call.price - WINNER_STAY) < 1, winner.call
     assert run.winner is winner and agent.receipt(run)[0].startswith("[VERIFIED] Queen West Inn")
-    assert run.llm_calls == 3, f"1 parse + 1 read per round, got {run.llm_calls}"
-    print("\nOK  integ pipeline: 2 rounds, wrong dates / voicemail / sold out rejected, cheapest total wins")
+    assert 1 < run.llm_calls <= 7, f"1 parse + 1 read per call that talked, got {run.llm_calls}"
+    print("\nOK  integ pipeline: 2 rounds, wrong dates / voicemail / sold out rejected, cheapest total wins, race cut the rest")
 
 
 if __name__ == "__main__":

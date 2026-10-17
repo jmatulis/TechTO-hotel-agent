@@ -487,6 +487,7 @@ async def t_pipeline():
         c.attempts += 1
         c.sid = "CA" + c.name.lower()
         c.history = [{"role": "user", "content": "Yes" if said[c.name][0] else "Sorry, we're full"}]
+        c.facts["available"] = said[c.name][0]
         c.status = "verified" if said[c.name][0] else "unavailable"   # live guess; transcript read wins
 
     async def no_tts(text):
@@ -515,7 +516,7 @@ async def t_pipeline():
         assert [c.status for c in run.cands if c.name == "H3"] == ["no_phone"]
         # H6 was listed highest but quoted lowest (125/night) -> it wins, total 250 for 2 nights
         assert w.name == "H6" and pl.stay_cost(run, w) == 250 and run.winner is w, w.name
-        assert len(llm_log) == 3, "1 parse + 1 transcript read per round"
+        assert len(llm_log) == 4, "1 parse + 1 read per call that talked (a clear 'no' is not re-read)"
         # the transcript read fills the CallQuery: summary, quoted stay price, availability
         cq = w.call
         assert (cq.summary, cq.price, cq.available) == ("H6 said yes", 250.0, True), cq
@@ -588,6 +589,79 @@ async def t_pipeline():
     finally:
         agent.PUBLIC_URL, agent.HTTP = saved_url, saved_http
     print("ok  pipeline preflight: empty/dead/5xx tunnel caught before dialing")
+
+
+async def t_race():
+    """Calls run at once; the table is re-read as each finishes. Early stop, wait-for-a-cheaper-one,
+    and the 1-minute (here: 0.4 s) cut-off. Times are scaled down; latency_cost scaled up to match."""
+    import decider
+    import pipeline as pl
+    from schemas import Hotel
+
+    # name: (listed stay price, seconds the call takes, does the hotel confirm, quoted stay price)
+    def setup(spec):
+        agent.RUN = run = agent.Run("x")
+        run.req = {"city": "T", "check_in": "2026-10-18", "check_out": "2026-10-19", "adults": 2}
+        run.cands = [pl.candidate(i, Hotel(id=n, name=n, price=v[0], currency="CAD", phone=f"+1416555010{i}"), 1)
+                     for i, (n, v) in enumerate(spec.items())]
+        return run
+
+    async def run_race(spec, **policy):
+        run = setup(spec)
+        seen, hung = [], []
+
+        async def fake_call(run_, c):
+            delay, ok, quote = spec[c.name][1:]
+            c.attempts += 1
+            c.status = "calling"
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                hung.append(c.name)                 # call_candidate hangs up on cancellation
+                c.status = "cancelled"
+                raise
+            c.history = [{"role": "user", "content": f"{c.name} says {'yes' if ok else 'no'}"}]
+            c.facts["available"] = ok
+            c.status = "verified" if ok else "unavailable"
+
+        async def fake_llm(m):
+            seen.append(m[1]["content"])
+            name = m[1]["content"].split(": ", 1)[1].split(" (")[0]
+            return {"calls": [{"id": int(m[1]["content"].split()[1].rstrip(":")), "available": spec[name][2],
+                               "nightly_price": spec[name][3], "summary": f"{name}"}]}
+
+        saved = (agent.call_candidate, agent.llm, pl.POLICY, agent.CALL_TIMEOUT)
+        agent.call_candidate, agent.llm = fake_call, fake_llm
+        pl.POLICY = decider.Policy(latency_cost=policy.get("latency_cost", 100.0), call_s=0.2, min_wait_s=0.02,
+                                   deadline_s=0.4)
+        agent.CALL_TIMEOUT = 0.4
+        t0 = time.perf_counter()
+        try:
+            w = await pl.race(run, run.cands)
+        finally:
+            agent.call_candidate, agent.llm, pl.POLICY, agent.CALL_TIMEOUT = saved
+        return run, w, time.perf_counter() - t0, hung
+
+    import time
+    # A. the cheapest listing confirms first: go now, the slow ones are hung up
+    run, w, took, hung = await run_race({"Cheap": (100, 0.05, True, 100), "Mid": (110, 3, True, 110),
+                                         "Dear": (150, 3, True, 150)})
+    assert w.name == "Cheap" and took < 0.6, (w and w.name, took)
+    assert sorted(hung) == ["Dear", "Mid"], hung
+    # B. an expensive hotel confirms first, a much cheaper one is still ringing: wait for it
+    run, w, took, hung = await run_race({"Cheap": (100, 0.2, True, 100), "Dear": (200, 0.02, True, 200)})
+    assert w.name == "Cheap" and not hung, (w.name, hung)
+    # B2. ... unless waiting is dear: with a huge price on latency the quick confirmation is taken
+    run, w, took, hung = await run_race({"Cheap": (100, 0.3, True, 100), "Dear": (200, 0.02, True, 200)},
+                                        latency_cost=1e6)
+    assert w.name == "Dear" and hung == ["Cheap"], (w.name, hung)
+    # C. a cheaper hotel that picks up too late (past the cut-off) is ignored, even if it would say yes
+    run, w, took, hung = await run_race({"Late": (100, 0.8, True, 90), "Dear": (200, 0.05, True, 200)})
+    assert w.name == "Dear" and run.cands[0].status in ("timeout", "cancelled") and run.cands[0].call is None
+    # D. nobody confirms: None, and every call was read or skipped without a crash
+    run, w, took, hung = await run_race({"A": (100, 0.02, False, None), "B": (110, 0.03, False, None)})
+    assert w is None
+    print("ok  race: early stop, waits for a much cheaper hotel only while it pays, cut-off ignores late calls")
 
 
 async def t_prompt_email():
@@ -793,6 +867,7 @@ async def t_recording():
 
 async def main():
     await t_recording()
+    await t_race()
     await t_prompt_email()
     await t_mailer()
     await t_hotel_search()
