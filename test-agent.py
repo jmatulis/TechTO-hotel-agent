@@ -289,6 +289,12 @@ async def t_tts():
     # voice_settings must be sent, or a library voice uses its own slow saved speed
     assert body["voice_settings"]["speed"] == agent.EL_SPEED, body
     assert '<Gather input="speech"' in xml and "/turn?c=" in xml
+    # default: audio BEFORE <Gather>, so no sound from the hotel can cut the agent off
+    assert xml.index("<Play>") < xml.index("<Gather"), xml
+    agent.BARGE_IN = True
+    xml = await agent.gather(cand, "Do you have a room?")
+    assert xml.index("<Gather") < xml.index("<Play>"), "BARGE_IN=1 nests audio inside Gather"
+    agent.BARGE_IN = False
     assert (agent.RUN.tts_calls, agent.RUN.tts_chars) == (1, len("Do you have a room?"))
 
     # same text again -> served from cache, no second API call

@@ -78,6 +78,7 @@ EL_FORMAT = E("ELEVEN_FORMAT", "mp3_22050_32")            # small file -> Twilio
 EL_MODE = E("ELEVEN_MODE", "all").lower()                 # all | opener | off
 EL_TIMEOUT = float(E("ELEVEN_TIMEOUT", "4"))              # past this we fall back rather than stall the call
 SPEECH_TIMEOUT = E("SPEECH_TIMEOUT", "auto")          # "auto" or seconds, e.g. "1"
+BARGE_IN = E("BARGE_IN", "0") == "1"                  # 1 = the hotel can cut the agent off mid-sentence
 MAX_TURNS = int(E("MAX_TURNS", "6"))
 CALL_TIMEOUT = float(E("CALL_TIMEOUT", "120"))        # per call attempt
 DIAL_RETRIES = int(E("DIAL_RETRIES", "1"))            # redials on busy / no answer
@@ -375,12 +376,15 @@ async def audio(key: str):
 
 
 async def gather(c: Candidate, say: str) -> str:
-    return (
-        f'<Response><Gather input="speech" action="{PUBLIC_URL}/turn?c={c.idx}" method="POST" '
-        f'speechTimeout="{SPEECH_TIMEOUT}" speechModel="phone_call" enhanced="true" '
-        f'actionOnEmptyResult="true" language="en-US">'
-        f'{await voice_el(say)}</Gather></Response>'
-    )
+    """Twilio has no bargeIn attribute, so placement is the control: audio nested inside
+    <Gather> is cut off by the first sound the hotel makes, audio before <Gather> always
+    finishes and the Gather then only listens."""
+    g = (f'<Gather input="speech" action="{PUBLIC_URL}/turn?c={c.idx}" method="POST" '
+         f'speechTimeout="{SPEECH_TIMEOUT}" speechModel="phone_call" enhanced="true" '
+         f'actionOnEmptyResult="true" language="en-US">')
+    v = await voice_el(say)
+    body = f"{g}{v}</Gather>" if BARGE_IN else f"{v}{g}</Gather>"
+    return f"<Response>{body}</Response>"
 
 
 async def hangup_twiml(say: str) -> str:
@@ -396,12 +400,16 @@ def nights(q: dict) -> int:
 
 
 def opener(run: Run, c: Candidate) -> str:
+    """One question, as short as possible. With BARGE_IN=0 this plays uninterrupted, so
+    every extra clause is dead air a real front desk has to sit through. The nights, the
+    exact rate and the cancellation policy are what the follow-up turns are for."""
     q, n = run.req, nights(run.req)
+    when = f"{date.fromisoformat(q['check_in']):%B %-d}"
+    stay = when if n == 1 else f"{n} nights from {when}"
     return (
-        f"Hi, this is an automated assistant calling for {GUEST_NAME}. Is this {c.name}? "
-        f"I'd like to check availability for {n} night{'s' * (n > 1)}, checking in "
-        f"{date.fromisoformat(q['check_in']):%B %d}, for {q['adults']} guest{'s' * (q['adults'] > 1)}. "
-        f"Online it shows about {c.price:.0f} {CURRENCY} a night. Do you have a room at that rate?"
+        f"Hi, this is an automated assistant calling for {GUEST_NAME}. Do you have a room "
+        f"available {stay} for {q['adults']} guest{'s' * (q['adults'] > 1)}, "
+        f"around {c.price:.0f} a night?"
     )
 
 
