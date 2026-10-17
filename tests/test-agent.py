@@ -181,12 +181,12 @@ async def t_webhook_and_email():
 
     agent.llm = fake_llm
     cl = TestClient(agent.app)
+    # available + price known -> hang up at once, even though the LLM wanted to ask about cancellation
     r = cl.post(f"/turn?c={w.idx}", data={"SpeechResult": "Yes we have a queen at 115 plus tax."})
-    assert "<Gather" in r.text and f"/turn?c={w.idx}" in r.text
+    assert "<Hangup/>" in r.text and w.status == "verified" and w.facts["price"] == 115, r.text
+    assert w.history[-1]["content"] == agent.BYE
     r = cl.post(f"/turn?c={other.idx}", data={"SpeechResult": "Sorry, we're fully booked."})
     assert "<Hangup/>" in r.text and other.status == "unavailable"
-    r = cl.post(f"/turn?c={w.idx}", data={"SpeechResult": "Free cancellation until 24 hours before. I'm Priya."})
-    assert "<Hangup/>" in r.text and w.status == "verified" and w.facts["price"] == 115
     cl.post(f"/status?c={w.idx}", data={"CallStatus": "completed", "CallDuration": "48"})
     assert cl.post("/turn?c=99", data={}).text == "<Response><Hangup/></Response>"
 
@@ -198,7 +198,7 @@ async def t_webhook_and_email():
     run.mark("calls")
     subj, text, html = agent.receipt(run)
     for must in ("Good Value Inn", "1 King St W", "+14165550101", "115.00 CAD", "230.00 CAD", "13% HST",
-                 "Free until 24h before", "Priya", "Cheap Dump", "No availability", "CALL TRANSCRIPT"):
+                 "Cheap Dump", "No availability", "CALL TRANSCRIPT"):
         assert must in text, must
     assert "<table" in html
     print("ok  webhooks (per-call state) + email\n\nSUBJECT:", subj, "\n" + text)
@@ -791,7 +791,45 @@ async def t_recording():
     print("ok  recording: calls recorded, winner's mp3 polled + fetched, attached via resend and smtp")
 
 
+async def t_short_call():
+    """Straight to the point: no guest name in the opener, only availability + price asked for,
+    Twilio caps the call at CALL_MAX_SECONDS, and a missing price keeps the call going."""
+    run = fresh()
+    c = run.cands[0]
+    op = agent.opener(run, c)
+    assert op.startswith("Hi, automated call. Do you have a room") and agent.GUEST_NAME not in op, op
+    assert len(op.split()) <= 25, f"opener too long: {len(op.split())} words"
+    sp = agent.system_prompt(run, c)
+    assert "ONLY two facts" in sp and "Never ask about fees" in sp
+
+    sent = []
+
+    class FakeHTTP:
+        async def post(self, url, auth=None, data=None):
+            sent.append(data)
+            return type("R", (), {"raise_for_status": lambda s: None, "json": lambda s: {"sid": "CA1"}})()
+
+    async def no_tts(text):
+        return None
+
+    saved = (agent.HTTP, agent.tts, agent.llm)
+    try:
+        agent.HTTP, agent.tts = FakeHTTP(), no_tts
+        await agent.place_call(run, c)
+        assert sent[0]["TimeLimit"] == str(agent.CALL_MAX_SECONDS) == "60", sent[0]
+
+        async def yes_no_price(m):     # hotel said yes but no number yet -> must ask, not hang up
+            return {"say": "What's the nightly rate?", "done": False, "available": True, "price": None}
+        agent.llm = yes_no_price
+        r = TestClient(agent.app).post(f"/turn?c={c.idx}", data={"SpeechResult": "Yes we do."})
+        assert "<Gather" in r.text and c.status != "verified", r.text
+    finally:
+        agent.HTTP, agent.tts, agent.llm = saved
+    print("ok  short call: no guest name, 2 facts only, 60s Twilio cap, hang up on confirmed price")
+
+
 async def main():
+    await t_short_call()
     await t_recording()
     await t_prompt_email()
     await t_mailer()

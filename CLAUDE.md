@@ -110,7 +110,7 @@ redial), `unreachable`, `timeout`, `cancelled` (a better option won), `no_phone`
 `SERPAPI_KEY`, `CALL_BATCH` (3), `MAX_ROUNDS` (3), `RADIUS_KM` (20, from city centre), `SEARCH_PAGES` (1), `GOOGLE_PLACES_KEY` (optional), `CURRENCY=CAD`,
 `SERP_GL=ca`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM`, `PHONE_OVERRIDE`, `TOP_K`,
 `RECORD_CALLS` (1 = record every call, attach the winner's mp3 to the email), `HOLD_ON_CALL` (1 = accept a hold or reservation if the hotel offers one), `TTS_VOICE`,
-`SPEECH_TIMEOUT`, `BARGE_IN` (0 = the agent is never interrupted), `MAX_TURNS`, `CALL_TIMEOUT`,
+`SPEECH_TIMEOUT`, `BARGE_IN` (0 = the agent is never interrupted), `MAX_TURNS`, `CALL_TIMEOUT`, `CALL_MAX_SECONDS` (60, Twilio hard cap per call),
 `DIAL_RETRIES`, `GUEST_NAME`, `JUDGE_EMAIL`,
 `ELEVEN_API_KEY`, `ELEVEN_VOICE_ID` (default `NOpBlnGInO9m6vDvFkFC`, Spuds Oxley),
 `ELEVEN_MODEL` (default `eleven_flash_v2_5`), `ELEVEN_FORMAT`, `ELEVEN_MODE`, `ELEVEN_TIMEOUT`,

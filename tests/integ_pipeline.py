@@ -123,7 +123,7 @@ async def main():
     for c in called:
         assert c.call.available is EXPECT[c.name] or (EXPECT[c.name] is None and not c.call.available), \
             f"{c.name}: expected {EXPECT[c.name]}, got {c.call.available} ({c.call.summary})"
-        assert c.call.transcript.startswith("Agent: Hi, this is an automated assistant"), c.name
+        assert c.call.transcript.startswith("Agent: Hi, automated call."), c.name
     assert {c.name for c in called} == set(DEMO), "all six demo hotels should have been called"
     assert winner is not None and winner.name == WINNER, f"winner {winner and winner.name}, wanted {WINNER}"
     assert abs(winner.call.price - WINNER_STAY) < 1, winner.call

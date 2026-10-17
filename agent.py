@@ -70,7 +70,8 @@ EL_KEY = E("ELEVEN_API_KEY", "")
 EL_VOICE = E("ELEVEN_VOICE_ID", "NOpBlnGInO9m6vDvFkFC")   # Spuds Oxley; see GET /v1/voices
 # Library voices carry their own (slow) saved settings; sending voice_settings overrides them.
 # speed 1.2 cut the opener from 30.7s to 17.3s of speech = less billed call time per run.
-EL_SPEED = float(E("ELEVEN_SPEED", "1.2"))                # 0.7 - 1.2
+# ElevenLabs rejects anything outside 0.7-1.2 with a 400 (then every line falls back to <Say>)
+EL_SPEED = min(1.2, max(0.7, float(E("ELEVEN_SPEED", "1.2"))))
 EL_STABILITY = float(E("ELEVEN_STABILITY", "0.5"))
 EL_SIMILARITY = float(E("ELEVEN_SIMILARITY", "0.75"))
 EL_MODEL = E("ELEVEN_MODEL", "eleven_flash_v2_5")         # flash = lowest latency tier
@@ -80,7 +81,9 @@ EL_TIMEOUT = float(E("ELEVEN_TIMEOUT", "4"))              # past this we fall ba
 SPEECH_TIMEOUT = E("SPEECH_TIMEOUT", "auto")          # "auto" or seconds, e.g. "1"
 BARGE_IN = E("BARGE_IN", "0") == "1"                  # 1 = the hotel can cut the agent off mid-sentence
 MAX_TURNS = int(E("MAX_TURNS", "6"))
-CALL_TIMEOUT = float(E("CALL_TIMEOUT", "120"))        # per call attempt
+CALL_TIMEOUT = float(E("CALL_TIMEOUT", "120"))        # per call attempt, incl. ringing (our side)
+CALL_MAX_SECONDS = int(E("CALL_MAX_SECONDS", "60"))   # Twilio hangs up after this long connected
+BYE = "Perfect, thanks. Goodbye."                     # fixed: its TTS is built once, reused every call
 DIAL_RETRIES = int(E("DIAL_RETRIES", "1"))            # redials on busy / no answer
 RECORD_CALLS = E("RECORD_CALLS", "1") == "1"          # Twilio records each call; the winner's mp3 is emailed
 HOLD_ON_CALL = E("HOLD_ON_CALL", "0") == "1"          # 1 -> accept a hold/reservation if offered
@@ -404,17 +407,16 @@ def nights(q: dict) -> int:
 
 
 def opener(run: Run, c: Candidate) -> str:
-    """One question, as short as possible. With BARGE_IN=0 this plays uninterrupted, so
-    every extra clause is dead air a real front desk has to sit through. The nights, the
-    exact rate and the cancellation policy are what the follow-up turns are for."""
+    """One question, straight to the point: no guest name, no preamble beyond the two words
+    that say it's automated. With BARGE_IN=0 this plays uninterrupted, so every extra clause is
+    billed dead air. A 'yes' to this confirms availability AND the rate in one turn."""
     q, n = run.req, nights(run.req)
     when = f"{date.fromisoformat(q['check_in']):%B %-d}"
     stay = when if n == 1 else f"{n} nights from {when}"
     room = f"{q['room_type']} room" if q.get("room_type") else "room"
     return (
-        f"Hi, this is an automated assistant calling for {GUEST_NAME}. Do you have a {room} "
-        f"available {stay} for {q['adults']} guest{'s' * (q['adults'] > 1)}, "
-        f"around {c.price:.0f} a night?"
+        f"Hi, automated call. Do you have a {room} available {stay} for "
+        f"{q['adults']} guest{'s' * (q['adults'] > 1)}, at {c.price:.0f} a night?"
     )
 
 
@@ -424,17 +426,19 @@ def system_prompt(run: Run, c: Candidate) -> str:
             "reference number. " if HOLD_ON_CALL else
             "Do not reserve or commit; you are only verifying. ")
     return (
-        f"You are an automated assistant on a live phone call with {c.name}, verifying a hotel room "
-        f"for {GUEST_NAME}: {q['check_in']} to {q['check_out']}, {q['adults']} adult(s)"
-        f"{', room type: ' + q['room_type'] if q.get('room_type') else ''}. "
-        f"Listed online at {c.price:.0f} {CURRENCY}/night. Confirm, one short question at a time: "
-        "is a room available for those dates, the nightly rate, taxes or fees, and the cancellation policy. "
+        f"You are an automated assistant on a live phone call with {c.name}. Calls are billed by the "
+        f"second: be as brief as possible. You asked if a room is available {q['check_in']} to "
+        f"{q['check_out']}, {q['adults']} adult(s)"
+        f"{', room type: ' + q['room_type'] if q.get('room_type') else ''}, at {c.price:.0f} {CURRENCY}/night. "
+        "You need ONLY two facts: is a room available, and the nightly price. If they say yes to your "
+        f"rate, price={c.price:.0f}. If one fact is missing, ask only for it in under 12 words. "
+        "Never ask about fees, cancellation or anything else; no small talk, no restating. "
         f"{hold}Never share payment details. Never invent facts. "
         'Reply ONLY JSON: {"say":str (<=25 words, natural speech),"done":bool,"available":bool|null,'
         '"price":number|null,"fees":str|null,"room_type":str|null,"cancellation":str|null,'
         '"check_in_time":str|null,"reference":str|null,"staff_name":str|null}. '
-        "Set done=true and say thanks and goodbye once availability and price are known, "
-        "or as soon as they say nothing is available."
+        "Set done=true the moment availability and price are both known, or as soon as they say "
+        "nothing is available; then say only a short goodbye."
     )
 
 
@@ -484,6 +488,11 @@ async def turn(request: Request):
         if out.get(k) is not None:
             c.facts[k] = out[k]
 
+    # Confirmed room + price is all we came for: hang up now, whatever the LLM wanted to ask next.
+    if c.facts.get("available") is True and c.facts.get("price") is not None:
+        c.history[-1]["content"] = say = BYE
+        finish(c)
+        return xml(await hangup_twiml(say))
     if out.get("done") or c.facts.get("available") is False or c.turns >= MAX_TURNS:
         finish(c)
         return xml(await hangup_twiml(say))
@@ -512,6 +521,7 @@ async def place_call(run: Run, c: Candidate) -> str:
               "Twiml": await gather(c, opener(run, c)),   # inline: no webhook hop before speaking
               "StatusCallback": f"{PUBLIC_URL}/status?c={c.idx}",
               "StatusCallbackEvent": "completed", "Timeout": "20",
+              "TimeLimit": str(CALL_MAX_SECONDS),         # hard cap, enforced by Twilio
               **({"Record": "true"} if RECORD_CALLS else {})},
     )
     r.raise_for_status()
