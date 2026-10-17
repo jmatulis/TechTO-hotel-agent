@@ -97,7 +97,7 @@ def build(req: dict, winner: dict | None, options: list[dict], stats: dict | Non
 
     With a `winner`, the email is about that one hotel: price, details, what it said on the call,
     and the call transcript as a chat. `options` is only listed (briefly) when nobody confirmed.
-    `stats` is accepted for compatibility and not shown."""
+    `stats` ({label: value}) is shown as a small "Run timing" block at the bottom."""
     w = winner
     n = req.get("nights") or 1
     if w:
@@ -141,6 +141,8 @@ def build(req: dict, winner: dict | None, options: list[dict], stats: dict | Non
         t += ["", "CALL TRANSCRIPT"] + [f"{who}: {txt}" for who, txt in chat]
     if tried:
         t += ["", "HOTELS TRIED"] + [" | ".join(map(str, r)) for r in tried]
+    if stats:
+        t += ["", "RUN TIMING"] + [f"{k}: {v}" for k, v in stats.items()]
     t += ["", FOOTER]
     text = "\n".join(map(str, t))
 
@@ -209,6 +211,8 @@ def build(req: dict, winner: dict | None, options: list[dict], stats: dict | Non
                  + (h3("Hotels tried") + listing if tried else "") + "</div>")
     html = (f"<div style='background:#f1f3f4;padding:20px 8px'><div style='max-width:600px;margin:0 auto;"
             f"background:#fff;border-radius:10px;overflow:hidden'>{inner}"
+            + (f"<div style='padding:0 20px'>{h3('Run timing')}"
+               + rows([(k, escape(str(v))) for k, v in stats.items()]) + "</div>" if stats else "") +
             f"<div style='{font};font-size:12px;color:#888;padding:14px 20px 20px'>{escape(FOOTER)}</div>"
             "</div></div>")
     return subject, text, html

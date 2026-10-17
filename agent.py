@@ -33,6 +33,8 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
+import obs
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -124,6 +126,7 @@ class Candidate:
         self.km = None            # distance from the city centre, when the search knew it
         self.call = None          # schemas.CallQuery, filled once the transcript is read
         self.hotel = None         # schemas.Hotel this candidate was built from (pipeline.py)
+        self.obs_ctx = None       # trace context of its call span, so /turn spans nest under it
         # call state
         self.status = "queued"
         self.call_status = None
@@ -159,6 +162,7 @@ class Run:
         self.tts_calls = self.tts_chars = 0
         self.t0 = time.perf_counter()
         self.marks: dict = {}
+        self.span = None          # the run's top-level observability span (pipeline.main)
 
     def mark(self, k: str):
         self.marks[k] = round(time.perf_counter() - self.t0, 3)
@@ -174,29 +178,33 @@ async def llm(messages: list) -> dict:
     """Backboard POST /threads/messages. No thread_id + memory off = stateless, so we
     send our own capped window and pay for nothing we didn't send.
     Their API has no max_tokens: brevity is enforced by the prompt alone."""
-    sys_p = " ".join(m["content"] for m in messages if m["role"] == "system")
-    turns = [m for m in messages if m["role"] != "system"]
-    content = turns[0]["content"] if len(turns) == 1 else "\n".join(
-        f"{'Hotel' if m['role'] == 'user' else 'You'}: {m['content']}" for m in turns)
-    body = {"content": content, "json_output": True, "memory": "off", "stream": False}
-    if sys_p:
-        body["system_prompt"] = sys_p
-    if BB_PROVIDER:
-        body["llm_provider"] = BB_PROVIDER
-    if BB_MODEL:
-        body["model_name"] = BB_MODEL
+    with obs.span("llm", model=BB_MODEL, provider=BB_PROVIDER, messages=len(messages)) as sp:
+        t0 = time.perf_counter()
+        sys_p = " ".join(m["content"] for m in messages if m["role"] == "system")
+        turns = [m for m in messages if m["role"] != "system"]
+        content = turns[0]["content"] if len(turns) == 1 else "\n".join(
+            f"{'Hotel' if m['role'] == 'user' else 'You'}: {m['content']}" for m in turns)
+        body = {"content": content, "json_output": True, "memory": "off", "stream": False}
+        if sys_p:
+            body["system_prompt"] = sys_p
+        if BB_PROVIDER:
+            body["llm_provider"] = BB_PROVIDER
+        if BB_MODEL:
+            body["model_name"] = BB_MODEL
 
-    r = await HTTP.post(f"{BB_BASE}/threads/messages", headers={"X-API-Key": BB_KEY}, json=body)
-    r.raise_for_status()
-    j = r.json()
-    RUN.tok_in += j.get("input_tokens") or 0
-    RUN.tok_out += j.get("output_tokens") or 0
-    RUN.llm_calls += 1
-    text = j.get("content") or ""
-    # Backboard answers 200 even when the upstream model fails; the error is in the body.
-    if j.get("status") == "FAILED" or text.startswith("LLM Error"):
-        raise RuntimeError(f"backboard: {text[:200]}")
-    return _jparse(text or j.get("message") or "")
+        r = await HTTP.post(f"{BB_BASE}/threads/messages", headers={"X-API-Key": BB_KEY}, json=body)
+        r.raise_for_status()
+        j = r.json()
+        RUN.tok_in += j.get("input_tokens") or 0
+        RUN.tok_out += j.get("output_tokens") or 0
+        RUN.llm_calls += 1
+        sp.set_attributes({"latency_s": round(time.perf_counter() - t0, 2), "tokens_in": j.get("input_tokens") or 0,
+                           "tokens_out": j.get("output_tokens") or 0})
+        text = j.get("content") or ""
+        # Backboard answers 200 even when the upstream model fails; the error is in the body.
+        if j.get("status") == "FAILED" or text.startswith("LLM Error"):
+            raise RuntimeError(f"backboard: {text[:200]}")
+        return _jparse(text or j.get("message") or "")
 
 
 def _jparse(s: str) -> dict:
@@ -348,20 +356,24 @@ async def tts(text: str) -> str | None:
     key = _akey(text)
     if key in AUDIO:                                   # repeated lines cost nothing
         return key
-    try:
-        r = await HTTP.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{EL_VOICE}",
-            headers={"xi-api-key": EL_KEY},
-            params={"output_format": EL_FORMAT},
-            json={"text": text, "model_id": EL_MODEL,
-                  "voice_settings": {"speed": EL_SPEED, "stability": EL_STABILITY,
-                                     "similarity_boost": EL_SIMILARITY}},
-            timeout=EL_TIMEOUT,
-        )
-        r.raise_for_status()
-    except Exception as e:                             # never stall a live call for TTS
-        print(f"[tts] {e!r}", file=sys.stderr)
-        return None
+    with obs.span("tts", chars=len(text), model=EL_MODEL) as sp:
+        t0 = time.perf_counter()
+        try:
+            r = await HTTP.post(
+                f"https://api.elevenlabs.io/v1/text-to-speech/{EL_VOICE}",
+                headers={"xi-api-key": EL_KEY},
+                params={"output_format": EL_FORMAT},
+                json={"text": text, "model_id": EL_MODEL,
+                      "voice_settings": {"speed": EL_SPEED, "stability": EL_STABILITY,
+                                         "similarity_boost": EL_SIMILARITY}},
+                timeout=EL_TIMEOUT,
+            )
+            r.raise_for_status()
+        except Exception as e:                         # never stall a live call for TTS
+            print(f"[tts] {e!r}", file=sys.stderr)
+            sp.set_attributes({"failed": True, "latency_s": round(time.perf_counter() - t0, 2)})
+            return None
+        sp.set_attributes({"latency_s": round(time.perf_counter() - t0, 2), "bytes": len(r.content)})
     AUDIO[key] = r.content
     RUN.tts_calls += 1
     RUN.tts_chars += len(text)
@@ -461,6 +473,19 @@ def _cand(request: Request) -> Candidate | None:
 @app.post("/turn")
 async def turn(request: Request):
     c = _cand(request)
+    with obs.activate(c.obs_ctx if c else None), obs.span("turn", hotel=c.name if c else None) as sp:
+        t0, seen = time.perf_counter(), len(c.history) if c else 0
+        resp = await _turn(request, c)
+        if c:
+            said = c.history[seen:]       # [] when the line was silent
+            sp.set_attributes({"n": c.turns, "latency_s": round(time.perf_counter() - t0, 2),
+                               "hotel_said": next((m["content"] for m in said if m["role"] == "user"), ""),
+                               "agent_said": next((m["content"] for m in said if m["role"] == "assistant"), ""),
+                               "facts": json.dumps(c.facts, default=str)})
+        return resp
+
+
+async def _turn(request: Request, c: Candidate | None):
     if c is None:
         return xml("<Response><Hangup/></Response>")
     form = await request.form()
@@ -515,22 +540,34 @@ TW_CALLS = "https://api.twilio.com/2010-04-01/Accounts/{sid}/Calls"
 
 async def place_call(run: Run, c: Candidate) -> str:
     c.attempts += 1
-    r = await HTTP.post(
-        TW_CALLS.format(sid=TW_SID) + ".json", auth=(TW_SID, TW_TOKEN),
-        data={"To": PHONE_OVERRIDE or c.phone, "From": TW_FROM,
-              "Twiml": await gather(c, opener(run, c)),   # inline: no webhook hop before speaking
-              "StatusCallback": f"{PUBLIC_URL}/status?c={c.idx}",
-              "StatusCallbackEvent": "completed", "Timeout": "20",
-              "TimeLimit": str(CALL_MAX_SECONDS),         # hard cap, enforced by Twilio
-              **({"Record": "true"} if RECORD_CALLS else {})},
-    )
-    r.raise_for_status()
-    return r.json()["sid"]
+    with obs.span("twilio create call", hotel=c.name, attempt=c.attempts) as sp:
+        r = await HTTP.post(
+            TW_CALLS.format(sid=TW_SID) + ".json", auth=(TW_SID, TW_TOKEN),
+            data={"To": PHONE_OVERRIDE or c.phone, "From": TW_FROM,
+                  "Twiml": await gather(c, opener(run, c)),   # inline: no webhook hop before speaking
+                  "StatusCallback": f"{PUBLIC_URL}/status?c={c.idx}",
+                  "StatusCallbackEvent": "completed", "Timeout": "20",
+                  "TimeLimit": str(CALL_MAX_SECONDS),         # hard cap, enforced by Twilio
+                  **({"Record": "true"} if RECORD_CALLS else {})},
+        )
+        r.raise_for_status()
+        sid = r.json()["sid"]
+        sp.set_attribute("call_sid", sid)
+        return sid
 
 
 async def recording_mp3(call_sid: str | None, wait: float = 20.0) -> bytes | None:
     """The call's recording as mp3 bytes, or None. Twilio finishes processing a few seconds after
     hangup, so poll until it's 'completed'. Media needs our auth: email the bytes, not the URL."""
+    with obs.span("recording", call_sid=call_sid) as sp:
+        t0 = time.perf_counter()
+        mp3 = await _recording_mp3(call_sid, wait)
+        sp.set_attributes({"found": mp3 is not None, "bytes": len(mp3 or b""),
+                           "latency_s": round(time.perf_counter() - t0, 2)})
+        return mp3
+
+
+async def _recording_mp3(call_sid: str | None, wait: float) -> bytes | None:
     if not call_sid:
         return None
     base = f"https://api.twilio.com/2010-04-01/Accounts/{TW_SID}/Recordings"

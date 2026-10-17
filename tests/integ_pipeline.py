@@ -24,6 +24,7 @@ import httpx
 import agent
 import hotel_search as hs
 import liteapi_search as lite
+import obs
 import pipeline as pl
 from schemas import Hotel
 
@@ -106,10 +107,13 @@ async def main():
     hs.serp, lite.find_hotels, agent.call_candidate, agent.tts = fake_serp, fake_lite, fake_call, no_tts
     agent.HTTP = hs.HTTP = httpx.AsyncClient(http2=True, timeout=30)
     agent.RUN = run = agent.Run(PROMPT)
+    obs.setup(service="hotel-agent-test")            # spans go to Logfire when a token is set
     try:
-        winner = await pl.run_pipeline(run)
+        with obs.span("hotel-agent run", test="integ_pipeline") as run.span:
+            winner = await pl.run_pipeline(run)
     finally:
         await agent.HTTP.aclose()
+        obs.flush()
 
     print(f"request: {run.req}\nllm: {run.llm_calls} calls, {run.tok_in}/{run.tok_out} tokens\n")
     for c in run.cands:

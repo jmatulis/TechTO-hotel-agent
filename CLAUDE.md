@@ -39,11 +39,12 @@ details. The agent does not negotiate, and by default it doesn't take payment or
 | `schemas.py`       | pydantic models: `HotelQuery`, `Hotel`, `CallQuery` (transcript, summary, quoted price, available), `RankWeights` |
 | `ranker.py`        | `merge` (de-dupe across sources), `rank` (price × distance × review penalty), `final_rank`/`cheapest` (after the calls: `available is True` only, by quoted price). No API calls |
 | `decider.py`       | Post-call stop rule: price table + band segments + latency cost; says when to stop waiting for the other calls (no I/O) |
+| `obs.py`           | Logfire spans (no-op without `LOGFIRE_WRITE_TOKEN`): run > parse/search/round > race > call > turn, email; latency + transcripts per call |
 | `tests/integ_pipeline.py` | Pipeline on six demo call transcripts with the real Backboard LLM; search and calls faked |
 | `tests/call_test.py`     | Dials one invented hotel: real call, no SerpApi, no email. Tune the call here         |
 | `README.md`        | Human-facing blueprint, API payloads, setup, checklist                               |
 | `.env.example`     | All config keys; copy to `.env` (never commit `.env`)                                |
-| `requirements.txt` | httpx[http2], fastapi, uvicorn, python-dotenv, python-multipart, pydantic>=2         |
+| `requirements.txt` | httpx[http2], fastapi, uvicorn, python-dotenv, python-multipart, pydantic>=2, logfire |
 
 ## How it runs (`main()` in agent.py)
 
@@ -111,7 +112,7 @@ redial), `unreachable`, `timeout`, `cancelled` (a better option won), `no_phone`
 `SERPAPI_KEY`, `MAX_ROUNDS` (3), `RADIUS_KM` (20, from city centre), `SEARCH_PAGES` (1), `GOOGLE_PLACES_KEY` (optional), `CURRENCY=CAD`,
 `SERP_GL=ca`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM`, `PHONE_OVERRIDE`, `TOP_K`,
 `RECORD_CALLS` (1 = record every call, attach the winner's mp3 to the email), `HOLD_ON_CALL` (1 = accept a hold or reservation if the hotel offers one), `TTS_VOICE`,
-`SPEECH_TIMEOUT`, `BARGE_IN` (0 = the agent is never interrupted), `MAX_TURNS`, `CALL_TIMEOUT` (45 s: later calls are cut off and never win; their partial transcript is kept), `CALL_MAX_SECONDS` (60, Twilio hard cap per call), `CALL_BATCH` (15 calls at once), `LATENCY_COST` (currency per second of waiting, 0.5), `SEGMENT_PCT` (price band width, 0.10),
+`SPEECH_TIMEOUT`, `BARGE_IN` (0 = the agent is never interrupted), `MAX_TURNS`, `CALL_TIMEOUT` (45 s: later calls are cut off and never win; their partial transcript is kept), `CALL_MAX_SECONDS` (60, Twilio hard cap per call), `LOGFIRE_WRITE_TOKEN` (empty = no tracing), `CALL_BATCH` (15 calls at once), `LATENCY_COST` (currency per second of waiting, 0.5), `SEGMENT_PCT` (price band width, 0.10),
 `DIAL_RETRIES`, `GUEST_NAME`, `JUDGE_EMAIL`,
 `ELEVEN_API_KEY`, `ELEVEN_VOICE_ID` (default `NOpBlnGInO9m6vDvFkFC`, Spuds Oxley),
 `ELEVEN_MODEL` (default `eleven_flash_v2_5`), `ELEVEN_FORMAT`, `ELEVEN_MODE`, `ELEVEN_TIMEOUT`,

@@ -14,6 +14,7 @@ import os
 import httpx
 from dotenv import load_dotenv
 
+import obs
 from ranker import distance_km
 from schemas import Hotel, HotelQuery
 
@@ -93,7 +94,12 @@ async def find_hotels(query: HotelQuery | None = None, **fields) -> list[Hotel]:
     """
     q = query or HotelQuery(**fields)
     async with httpx.AsyncClient(timeout=30) as http:
-        lat, lng = await _city_center(http, q)
-        hotels = await _priced_hotels(http, q, lat, lng)
-        await asyncio.gather(*(_add_phone(http, h, q.city) for h in hotels))
+        with obs.span("places city centre", city=q.city):
+            lat, lng = await _city_center(http, q)
+        with obs.span("liteapi rates", pool=q.pool, timeout_s=q.lite_timeout) as sp:
+            hotels = await _priced_hotels(http, q, lat, lng)
+            sp.set_attribute("hotels", len(hotels))
+        with obs.span("places phones", hotels=len(hotels)) as sp:
+            await asyncio.gather(*(_add_phone(http, h, q.city) for h in hotels))
+            sp.set_attribute("with_phone", sum(1 for h in hotels if h.phone))
     return hotels

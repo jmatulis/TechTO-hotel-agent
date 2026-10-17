@@ -26,6 +26,7 @@ from datetime import date, timedelta
 
 import httpx
 
+import obs
 from ranker import distance_km as km
 from schemas import Hotel, HotelQuery
 
@@ -61,9 +62,10 @@ async def post(url: str, headers: dict, body: dict) -> dict:
 async def serp(params: dict) -> dict:
     """SerpApi GET; tests swap it out."""
     COUNT["serpapi"] += 1
-    r = await HTTP.get("https://serpapi.com/search.json", params={**params, "api_key": SERPAPI_KEY})
-    r.raise_for_status()
-    return r.json()
+    with obs.span("serpapi", engine=params.get("engine"), kind="details" if "property_token" in params else "search"):
+        r = await HTTP.get("https://serpapi.com/search.json", params={**params, "api_key": SERPAPI_KEY})
+        r.raise_for_status()
+        return r.json()
 
 
 # ---------------------------------------------------------------- SerpApi Google Hotels
