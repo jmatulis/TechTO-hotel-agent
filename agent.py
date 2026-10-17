@@ -186,7 +186,11 @@ async def _llm_backboard(messages: list, max_tokens: int) -> dict:
     RUN.tok_in += j.get("input_tokens") or 0
     RUN.tok_out += j.get("output_tokens") or 0
     RUN.llm_calls += 1
-    return _jparse(j.get("content") or j.get("message") or "")
+    text = j.get("content") or ""
+    # Backboard answers 200 even when the upstream model fails; the error is in the body.
+    if j.get("status") == "FAILED" or text.startswith("LLM Error"):
+        raise RuntimeError(f"backboard: {text[:200]}")
+    return _jparse(text or j.get("message") or "")
 
 
 def _jparse(s: str) -> dict:

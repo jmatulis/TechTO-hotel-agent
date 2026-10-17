@@ -260,8 +260,17 @@ async def t_llm_backends():
     await REAL_LLM([{"role": "user", "content": "find me a hotel"}])
     assert sent[-1][2]["content"] == "find me a hotel" and "system_prompt" not in sent[-1][2]
 
+    # Backboard reports upstream model failures as HTTP 200 + status FAILED
+    agent.HTTP = FakeHTTP({"message": "Message added successfully", "status": "FAILED",
+                           "content": "LLM Error: LLM Invocation Error: Error code: 404"})
+    try:
+        await REAL_LLM(msgs)
+        raise AssertionError("FAILED status should raise, not return junk")
+    except RuntimeError as e:
+        assert "backboard" in str(e), e
+
     agent.LLM_BACKEND = "openai"
-    print("ok  llm backends: openai-compatible + backboard, stateless, tokens counted")
+    print("ok  llm backends: openai-compatible + backboard, stateless, tokens, 200-FAILED")
 
 
 async def main():
