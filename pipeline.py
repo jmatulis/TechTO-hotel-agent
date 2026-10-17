@@ -300,7 +300,8 @@ async def run_pipeline(run: agent.Run) -> agent.Candidate | None:
             break
         print(f"round {rnd}: calling " + ", ".join(f"{c.name} ({c.price:.0f})" for c in batch),
               file=sys.stderr)
-        await asyncio.gather(*(agent.tts(agent.opener(run, c)) for c in batch))   # pre-build openers
+        await asyncio.gather(agent.tts(agent.BYE),                          # pre-build openers + goodbye
+                             *(agent.tts(agent.opener(run, c)) for c in batch))
         winner = await race(run, batch)
         run.mark(f"round{rnd}")
         if winner:
