@@ -2,7 +2,7 @@
 
 LiteAPI prices a pool of hotels in one call (we sort by price ourselves, because its
 `limit` applies to its popularity ranking before sorting). Google Places then supplies
-each hotel's phone number, in parallel.
+each hotel's phone number and reviews, in parallel.
 
     hotels = await find_hotels(HotelQuery(city="Toronto"))
     hotels = await find_hotels(city="Toronto", adults=1, radius_m=10_000)
@@ -72,7 +72,7 @@ async def _priced_hotels(http: httpx.AsyncClient, q: HotelQuery, lat: float, lng
 
 
 async def _add_phone(http: httpx.AsyncClient, hotel: Hotel, city: str) -> None:
-    """Fill `phone` and `places_name` in place; leave them None if Places finds nothing."""
+    """Fill phone, matched name and Google reviews in place; leave them None if Places finds nothing."""
     try:
         r = await http.post(
             PLACES_URL, json={
@@ -80,13 +80,16 @@ async def _add_phone(http: httpx.AsyncClient, hotel: Hotel, city: str) -> None:
                 "locationBias": {"circle": {"center": {"latitude": hotel.lat, "longitude": hotel.lng},
                                             "radius": 500.0}}},
             headers={"X-Goog-Api-Key": os.environ["GOOGLE_PLATFORM_API_KEY"],
-                     "X-Goog-FieldMask": "places.displayName,places.internationalPhoneNumber"})
+                     "X-Goog-FieldMask": "places.displayName,places.internationalPhoneNumber,"
+                                                "places.rating,places.userRatingCount"})
         r.raise_for_status()
         place = (r.json().get("places") or [{}])[0]
     except httpx.HTTPError:
         return
     hotel.phone = place.get("internationalPhoneNumber")
     hotel.places_name = (place.get("displayName") or {}).get("text")
+    hotel.review_rating = place.get("rating")
+    hotel.review_count = place.get("userRatingCount")
 
 
 async def find_hotels(query: HotelQuery | None = None, **fields) -> list[Hotel]:
