@@ -14,6 +14,8 @@ Pipeline (one process, one event loop):
 Run:  python agent.py "Find the best hotel deal in Toronto for 2026-10-18 to 2026-10-19, send to judge@x.com"
 Test: set PHONE_OVERRIDE=<your cell> -> every call goes to you, one at a time, best first.
 """
+from __future__ import annotations
+
 import asyncio
 import json
 import os
@@ -45,6 +47,12 @@ PORT = int(E("PORT", "8080"))
 LLM_BASE = E("LLM_BASE_URL", "https://api.groq.com/openai/v1")  # any OpenAI-compatible endpoint
 LLM_KEY = E("LLM_API_KEY", "")
 LLM_MODEL = E("LLM_MODEL", "llama-3.1-8b-instant")    # check Groq's current model list the morning of
+
+LLM_BACKEND = E("LLM_BACKEND", "openai").lower()      # "openai" = any OpenAI-compatible (Groq); "backboard"
+BB_BASE = E("BACKBOARD_BASE_URL", "https://app.backboard.io/api").rstrip("/")
+BB_KEY = E("BACKBOARD_API_KEY", "")
+BB_PROVIDER = E("BACKBOARD_PROVIDER", "")             # openai | anthropic | google | openrouter; blank = their default
+BB_MODEL = E("BACKBOARD_MODEL", "")                   # blank = their default gpt-4o, which is SLOW for a live call
 
 SERPAPI_KEY = E("SERPAPI_KEY", "")
 CURRENCY = E("CURRENCY", "CAD")
@@ -135,6 +143,12 @@ app = FastAPI()
 
 # ---------------------------------------------------------------- LLM
 async def llm(messages: list, max_tokens: int = 110) -> dict:
+    """One seam for every model call. LLM_BACKEND picks the wire format."""
+    impl = _llm_backboard if LLM_BACKEND == "backboard" else _llm_openai
+    return await impl(messages, max_tokens)
+
+
+async def _llm_openai(messages: list, max_tokens: int) -> dict:
     r = await HTTP.post(
         f"{LLM_BASE}/chat/completions",
         headers={"Authorization": f"Bearer {LLM_KEY}"},
@@ -148,6 +162,38 @@ async def llm(messages: list, max_tokens: int = 110) -> dict:
     RUN.tok_out += u.get("completion_tokens", 0)
     RUN.llm_calls += 1
     return json.loads(j["choices"][0]["message"]["content"])
+
+
+async def _llm_backboard(messages: list, max_tokens: int) -> dict:
+    """POST /threads/messages. No thread_id + memory off = stateless, so we keep
+    sending our own capped window and the token bill stays what it is today.
+    Their API has no max_tokens: brevity is enforced by the prompt alone."""
+    sys_p = " ".join(m["content"] for m in messages if m["role"] == "system")
+    turns = [m for m in messages if m["role"] != "system"]
+    content = turns[0]["content"] if len(turns) == 1 else "\n".join(
+        f"{'Hotel' if m['role'] == 'user' else 'You'}: {m['content']}" for m in turns)
+    body = {"content": content, "json_output": True, "memory": "off", "stream": False}
+    if sys_p:
+        body["system_prompt"] = sys_p
+    if BB_PROVIDER:
+        body["llm_provider"] = BB_PROVIDER
+    if BB_MODEL:
+        body["model_name"] = BB_MODEL
+
+    r = await HTTP.post(f"{BB_BASE}/threads/messages", headers={"X-API-Key": BB_KEY}, json=body)
+    r.raise_for_status()
+    j = r.json()
+    RUN.tok_in += j.get("input_tokens") or 0
+    RUN.tok_out += j.get("output_tokens") or 0
+    RUN.llm_calls += 1
+    return _jparse(j.get("content") or j.get("message") or "")
+
+
+def _jparse(s: str) -> dict:
+    """Lenient JSON: strip code fences / stray prose some models add."""
+    s = s.strip()
+    i, j = s.find("{"), s.rfind("}")
+    return json.loads(s[i:j + 1] if 0 <= i < j else s)
 
 
 # ---------------------------------------------------------------- step 1: parse
