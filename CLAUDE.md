@@ -32,6 +32,8 @@ details. The agent does not negotiate, and by default it doesn't take payment or
 | ------------------ | ------------------------------------------------------------------------------------ |
 | `agent.py`         | The whole agent: config, search, ranking, Twilio webhooks, call orchestration, email |
 | `test-agent.py`    | Offline tests; every outside service is faked. **Run after every change.**           |
+| `pipeline.py`      | Prompt → Backboard parse → hotel_search → call cheapest `CALL_BATCH` → Backboard reads transcripts → cheapest confirmed; next batch if none |
+| `hotel_search.py`  | CLI: cheapest rates in a city via SerpApi Google Hotels, phones via details page / Places / Maps |
 | `call_test.py`     | Dials one invented hotel: real call, no SerpApi, no email. Tune the call here         |
 | `README.md`        | Human-facing blueprint, API payloads, setup, checklist                               |
 | `.env.example`     | All config keys; copy to `.env` (never commit `.env`)                                |
@@ -100,7 +102,7 @@ redial), `unreachable`, `timeout`, `cancelled` (a better option won), `no_phone`
 
 `PUBLIC_URL` (tunnel URL, must be current), `PORT`, `BACKBOARD_API_KEY`, `BACKBOARD_BASE_URL`,
 `BACKBOARD_PROVIDER` (default `cerebras`), `BACKBOARD_MODEL` (default `openai/gpt-oss-120b`),
-`SERPAPI_KEY`, `CURRENCY=CAD`,
+`SERPAPI_KEY`, `CALL_BATCH` (3), `MAX_ROUNDS` (3), `RADIUS_KM` (20, from city centre), `SEARCH_PAGES` (1), `GOOGLE_PLACES_KEY` (optional), `CURRENCY=CAD`,
 `SERP_GL=ca`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM`, `PHONE_OVERRIDE`, `TOP_K`,
 `HOLD_ON_CALL` (1 = accept a hold or reservation if the hotel offers one), `TTS_VOICE`,
 `SPEECH_TIMEOUT`, `BARGE_IN` (0 = the agent is never interrupted), `MAX_TURNS`, `CALL_TIMEOUT`,
@@ -117,6 +119,9 @@ pip install -r requirements.txt
 .venv/bin/python test-agent.py                         # offline tests, no keys needed
 cloudflared tunnel --url http://localhost:8080         # or: ngrok http 8080 → PUBLIC_URL
 .venv/bin/python call_test.py "Good Value Inn" 129      # ONE real call, no search, no email
+.venv/bin/python pipeline.py "King room in Toronto Oct 18-19 for 2, send to judge@x.com"   # full flow
+.venv/bin/python pipeline.py --list "I'm looking for Toronto, for 3 people, Oct 18 to Oct 20"   # parse + search + phones, no calls
+.venv/bin/python hotel_search.py Toronto 2026-10-18 --top 10 --phones    # rates + phones
 .venv/bin/python agent.py "Find the best hotel deal in Toronto for 2026-10-18 to 2026-10-19, send to judge@x.com"
 ```
 

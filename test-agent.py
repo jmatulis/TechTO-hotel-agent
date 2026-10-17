@@ -347,7 +347,162 @@ def t_billed_seconds():
     print("ok  billed_seconds: Twilio figure preferred, local measure as fallback")
 
 
+async def t_hotel_search():
+    """SerpApi rates -> sorted by total; phone lookups only with --phones, top N only."""
+    import hotel_search as hs
+
+    assert hs.e164("+1 416-555-0101") == "+14165550101" and hs.e164("(416) 555-0101") == "+14165550101"
+    assert hs.e164("555-0101") is None
+
+    serp_log = []
+
+    async def fake_serp(params):
+        serp_log.append(params.get("property_token") or params["sort_by"])
+        if "property_token" in params:
+            return {"phone": "(416) 555-01" + params["property_token"][-2:], "address": "9 Front St"}
+        return {"properties": [   # sort_by=3 comes back only roughly ascending
+            {"name": "B", "rate_per_night": {"extracted_lowest": 95}, "property_token": "t02"},
+            {"name": "A", "rate_per_night": {"extracted_lowest": 90}, "property_token": "t01"},
+            {"name": "No price", "property_token": "t09"},
+            {"name": "C", "rate_per_night": {"extracted_lowest": 99},
+             "total_rate": {"extracted_lowest": 210, "extracted_before_taxes_fees": 180},
+             "property_token": "t03"}]}
+
+    hs.serp = fake_serp
+    rows = await hs.search("Toronto", "2026-10-18", nights=2, top=2)
+    assert [(r["name"], r["total"]) for r in rows] == [("A", 180.0), ("B", 190.0)], rows
+    assert serp_log == ["3"] and rows[0]["phone"] is None, "no detail lookups without --phones"
+    rows = await hs.search("Toronto", "2026-10-18", nights=2, top=3)
+    assert rows[2]["pre_tax"] == 180 and rows[0]["pre_tax"] is None, rows
+    serp_log.clear(); serp_log.append("3")
+    rows = await hs.search("Toronto", "2026-10-18", top=2, phones=True)
+    assert [r["phone"] for r in rows] == ["+14165550101", "+14165550102"], rows
+    assert serp_log[1:] == ["3", "t01", "t02"], serp_log
+
+    # radius: geocode the place once, page through results, keep only hotels inside the circle
+    cn = (43.6426, -79.3871)                                   # CN Tower
+    pages_log = []
+
+    async def fake_serp_geo(params):
+        if params["engine"] == "google_maps":
+            pages_log.append("geo:" + params["q"])
+            return {"place_results": {"gps_coordinates": {"latitude": cn[0], "longitude": cn[1]}}}
+        pages_log.append(params.get("next_page_token") or params["q"])
+
+        def prop(name, price, lat, lng):
+            return {"name": name, "rate_per_night": {"extracted_lowest": price},
+                    "gps_coordinates": {"latitude": lat, "longitude": lng}}
+        if "next_page_token" not in params:
+            return {"properties": [prop("Far Cheap", 60, 43.7735, -79.2577),       # Scarborough ~18 km
+                                   prop("Near", 120, 43.6453, -79.3806)],           # ~0.6 km
+                    "serpapi_pagination": {"next_page_token": "p2"}}
+        return {"properties": [prop("City Hall-ish", 110, 43.6532, -79.3832),       # ~1.2 km
+                               {"name": "No GPS", "rate_per_night": {"extracted_lowest": 50}}]}
+
+    hs.serp = fake_serp_geo
+    rows = await hs.search("Toronto", "2026-10-18", near="CN Tower", radius_km=2, pages=2)
+    assert [r["name"] for r in rows] == ["City Hall-ish", "Near"], rows
+    assert rows[0]["km"] == 1.22 and rows[1]["km"] < 1, rows
+    assert pages_log == ["geo:CN Tower, Toronto", "hotels near CN Tower, Toronto", "p2"], pages_log
+    pages_log.clear()
+    rows = await hs.search("Toronto", "2026-10-18", near="43.6426, -79.3871", radius_km=1)
+    assert [r["name"] for r in rows] == ["Near"] and pages_log == ["hotels in Toronto"], pages_log
+
+    # namesake town: geocode says Whitby, England, hotels are in Whitby, Ontario -> use the hotels
+    async def fake_serp_whitby(params):
+        if params["engine"] == "google_maps":
+            assert params.get("gl") == hs.GL, "geocode must be localized like the hotel search"
+            return {"place_results": {"gps_coordinates": {"latitude": 54.4863, "longitude": -0.6133}}}
+        return {"properties": [
+            {"name": n, "rate_per_night": {"extracted_lowest": p}, "gps_coordinates": {"latitude": la, "longitude": lo}}
+            for n, p, la, lo in (("Quality Suites Whitby", 127, 43.8724, -78.8961),
+                                 ("Travelodge Oshawa Whitby", 115, 43.8738, -78.8905),
+                                 ("Idlewood Inn", 97, 43.7603, -79.1972),       # Scarborough, ~25 km
+                                 ("Spark Oshawa", 126, 43.8744, -78.8782))]}
+
+    hs.serp = fake_serp_whitby
+    rows = await hs.search("Whitby", "2026-10-18", near="Whitby", radius_km=20)
+    assert [r["name"] for r in rows] == ["Travelodge Oshawa Whitby", "Spark Oshawa", "Quality Suites Whitby"], rows
+    print("ok  hotel_search: serp cheapest sorted, pre-tax, phones only with --phones, radius + pages")
+
+
+async def t_pipeline():
+    """Backboard parse -> search -> call batch of 3 -> transcripts read -> cheapest *quoted* wins.
+    Round 1: nobody available -> round 2. A phone-less hotel is skipped and backfilled."""
+    import hotel_search as hs
+    import pipeline as pl
+
+    saved = (agent.llm, agent.call_candidate, agent.tts, hs.serp, hs.PLACES_KEY)
+    agent.PHONE_OVERRIDE, hs.PLACES_KEY = "", ""
+    pl.BATCH, pl.MAX_ROUNDS, pl.RADIUS_KM, pl.SEARCH_PAGES = 3, 3, 20, 1
+    prices = {"H0": 90, "H1": 95, "H2": 99, "H3": 100, "H4": 104, "H5": 110, "H6": 120}
+    # what each hotel "says" on the phone: (available, quoted nightly)
+    said = {"H0": (False, None), "H1": (False, None), "H2": (False, None),
+            "H4": (True, 170), "H5": (True, 130), "H6": (True, 125)}   # H3 has no phone
+    llm_log, dialed = [], []
+
+    async def fake_llm(m):
+        llm_log.append(m)
+        if "Extract the hotel booking" in m[0]["content"]:
+            return {"city": "Toronto", "check_in": "2026-10-18", "check_out": "2026-10-20",
+                    "adults": 2, "room_type": "king", "email": "judge@techto.ca"}
+        assert "transcripts" in m[0]["content"] and "room type king" in m[0]["content"]
+        out = []
+        for block in m[1]["content"].split("\n\n"):
+            idx = int(block.split()[1].rstrip(":"))
+            name = block.split(": ", 1)[1].split(" (")[0]
+            a, p = said[name]
+            out.append({"id": idx, "available": a, "nightly_price": p, "total_price": None,
+                        "room_type": "King" if a else None, "check_in": None, "check_out": None})
+        return {"calls": out}
+
+    async def fake_serp(params):
+        if "property_token" in params:
+            name = params["property_token"]
+            return {"phone": None if name == "H3" else "416-555-01" + name[1:].zfill(2)}
+        if params["engine"] == "google_maps":
+            if params["q"] == "Toronto":                       # geocoding the city centre
+                return {"place_results": {"gps_coordinates": {"latitude": 43.6532, "longitude": -79.3832}}}
+            return {"local_results": [{"phone": None}]}
+        assert params["q"] == "hotels in Toronto", params      # centre = city: query unchanged
+        props = [{"name": n, "rate_per_night": {"extracted_lowest": p}, "property_token": n,
+                  "gps_coordinates": {"latitude": 43.66, "longitude": -79.39}} for n, p in prices.items()]
+        # cheapest of all, but ~50 km away in Hamilton: outside RADIUS_KM, never called
+        props.append({"name": "Far", "rate_per_night": {"extracted_lowest": 40}, "property_token": "Far",
+                      "gps_coordinates": {"latitude": 43.2557, "longitude": -79.8711}})
+        return {"properties": props}
+
+    async def fake_call(run_, c):
+        dialed.append(c.name)
+        c.attempts += 1
+        c.history = [{"role": "user", "content": "Yes" if said[c.name][0] else "Sorry, we're full"}]
+        c.status = "verified" if said[c.name][0] else "unavailable"   # live guess; transcript read wins
+
+    async def no_tts(text):
+        return None
+
+    agent.llm, agent.call_candidate, agent.tts, hs.serp = fake_llm, fake_call, no_tts, fake_serp
+    try:
+        agent.RUN = run = agent.Run("King room in Toronto Oct 18-20 for 2, send to judge@techto.ca")
+        w = await pl.run_pipeline(run)
+        assert run.req["room_type"] == "king" and run.req["check_out"] == "2026-10-20", run.req
+        assert "a king room" in agent.opener(run, run.cands[0])
+        assert dialed == ["H0", "H1", "H2", "H4", "H5", "H6"], dialed          # H3 backfilled, Far out of radius
+        assert "Far" not in [c.name for c in run.cands]
+        assert [c.status for c in run.cands if c.name == "H3"] == ["no_phone"]
+        # H6 was listed highest but quoted lowest (125/night) -> it wins, total 250 for 2 nights
+        assert w.name == "H6" and pl.stay_cost(run, w) == 250 and run.winner is w, w.name
+        assert len(llm_log) == 3, "1 parse + 1 transcript read per round"
+        rep = pl.report(run)
+        assert rep["winner"]["name"] == "H6" and len(rep["called"]) == 7
+    finally:
+        agent.llm, agent.call_candidate, agent.tts, hs.serp, hs.PLACES_KEY = saved
+    print("ok  pipeline: parse, search, batch of 3, next batch when none free, cheapest quote wins")
+
+
 async def main():
+    await t_hotel_search()
+    await t_pipeline()
     await t_parse()
     await t_llm()
     await t_tts()
