@@ -406,8 +406,9 @@ def opener(run: Run, c: Candidate) -> str:
     q, n = run.req, nights(run.req)
     when = f"{date.fromisoformat(q['check_in']):%B %-d}"
     stay = when if n == 1 else f"{n} nights from {when}"
+    room = f"{q['room_type']} room" if q.get("room_type") else "room"
     return (
-        f"Hi, this is an automated assistant calling for {GUEST_NAME}. Do you have a room "
+        f"Hi, this is an automated assistant calling for {GUEST_NAME}. Do you have a {room} "
         f"available {stay} for {q['adults']} guest{'s' * (q['adults'] > 1)}, "
         f"around {c.price:.0f} a night?"
     )
@@ -420,7 +421,8 @@ def system_prompt(run: Run, c: Candidate) -> str:
             "Do not reserve or commit; you are only verifying. ")
     return (
         f"You are an automated assistant on a live phone call with {c.name}, verifying a hotel room "
-        f"for {GUEST_NAME}: {q['check_in']} to {q['check_out']}, {q['adults']} adult(s). "
+        f"for {GUEST_NAME}: {q['check_in']} to {q['check_out']}, {q['adults']} adult(s)"
+        f"{', room type: ' + q['room_type'] if q.get('room_type') else ''}. "
         f"Listed online at {c.price:.0f} {CURRENCY}/night. Confirm, one short question at a time: "
         "is a room available for those dates, the nightly rate, taxes or fees, and the cancellation policy. "
         f"{hold}Never share payment details. Never invent facts. "
