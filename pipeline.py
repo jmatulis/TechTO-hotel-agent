@@ -1,6 +1,7 @@
 """
-Prompt -> Backboard parse -> hotel_search -> phone the cheapest CALL_BATCH hotels -> Backboard reads
-every transcript -> cheapest hotel that actually confirmed. Nobody available -> next batch.
+Prompt -> Backboard parse -> search SerpApi + LiteAPI -> merge and rank -> phone the best CALL_BATCH
+hotels -> Backboard reads every transcript into a CallQuery -> cheapest hotel that confirmed a room.
+Nobody available -> next batch.
 
   python pipeline.py "King room in Toronto, Oct 18 to 19, 2 adults, send to judge@x.com"
   python pipeline.py --list "I'm looking for Toronto, for 3 people, Oct 18 to Oct 20"   # no calls
@@ -23,12 +24,16 @@ import uvicorn
 
 import agent
 import hotel_search as hs
+import liteapi_search as lite
+import ranker
+from schemas import CallQuery, Hotel, HotelQuery
 
 E = agent.E
 BATCH = int(E("CALL_BATCH", "3"))              # hotels phoned per round
 MAX_ROUNDS = int(E("MAX_ROUNDS", "3"))         # give up after this many rounds with nobody available
 RADIUS_KM = float(E("RADIUS_KM", "20"))        # only hotels this close to the city centre; 0 = off
 SEARCH_PAGES = int(E("SEARCH_PAGES", "1"))     # google_hotels pages (~20 hotels, 1 credit each)
+COUNTRY = E("SERP_GL", "ca").upper()           # ISO-2 for LiteAPI nationality and the Places lookups
 
 
 # ---------------------------------------------------------------- 1. parse
@@ -72,29 +77,47 @@ async def parse(prompt: str) -> dict:
 
 
 # ---------------------------------------------------------------- 2. search
-async def search(req: dict) -> list[dict]:
-    """SerpApi Google Hotels, cheapest first, within RADIUS_KM of the city centre (one extra
-    google_maps search to locate it). No room types: those are asked about on the call."""
-    return await hs.search(req["city"], req["check_in"], agent.nights(req), req["adults"],
-                           top=BATCH * MAX_ROUNDS * 2,      # spare rows for hotels with no phone
-                           near=req["city"] if RADIUS_KM else None, radius_km=RADIUS_KM,
-                           pages=SEARCH_PAGES)
+async def search(req: dict) -> list[Hotel]:
+    """SerpApi and LiteAPI in parallel, merged (a hotel found by both keeps its cheaper price) and
+    ranked: which to phone first. One source failing is fine; both failing raises. No room types:
+    those are asked about on the call. LiteAPI brings phones; SerpApi phones are looked up lazily."""
+    q = HotelQuery(city=req["city"], country=COUNTRY, check_in=req["check_in"], check_out=req["check_out"],
+                   adults=req["adults"], currency=agent.CURRENCY,
+                   radius_m=int(RADIUS_KM * 1000) if RADIUS_KM else 100_000,
+                   limit=BATCH * MAX_ROUNDS * 2)            # spare hotels for ones with no phone
+    sources = {"serpapi": hs.find_hotels(q, phones=False, pages=SEARCH_PAGES), "liteapi": lite.find_hotels(q)}
+    results = await asyncio.gather(*sources.values(), return_exceptions=True)
+    lists = []
+    for name, r in zip(sources, results):
+        if isinstance(r, BaseException):
+            print(f"[search] {name} failed: {r!r}", file=sys.stderr)
+        else:
+            lists.append(r)
+    if not lists:
+        raise next(r for r in results if isinstance(r, BaseException))
+    return ranker.rank(ranker.merge(*lists))
 
 
-async def phone(row: dict, req: dict):
-    """Details page by token, then Google Places if keyed, then a Google Maps search."""
+async def phone(h: Hotel, req: dict):
+    """Fill `h.phone` if missing: SerpApi details page (SerpApi hotels only), then Google Places
+    if keyed, then a Google Maps search."""
+    if h.phone:
+        return
+    row = {"hotel_id": h.id if h.source == "serpapi" else None, "name": h.name,
+           "address": h.address, "phone": None}
     if row["hotel_id"]:
         await hs.serp_phone(row, hs._serp_params(req["city"], req["check_in"], req["check_out"], req["adults"]))
     if not row["phone"] and hs.PLACES_KEY:
         await hs.phone_for(row, req["city"])
     if not row["phone"]:
         await hs.maps_phone(row, req["city"])
+    h.phone, h.address = row["phone"], row["address"] or h.address
 
 
-def candidate(i: int, row: dict) -> agent.Candidate:
-    c = agent.Candidate(i, {"name": row["name"], "overall_rating": row.get("rating")},
-                        row["per_night"], row["total"])
-    c.total, c.address, c.phone = row["total"], row.get("address"), row.get("phone")
+def candidate(i: int, h: Hotel, nights: int) -> agent.Candidate:
+    c = agent.Candidate(i, {"name": h.name, "overall_rating": h.review_rating, "reviews": h.review_count},
+                        h.price / nights, h.score or h.price)
+    c.total, c.address, c.phone, c.km, c.hotel = h.price, h.address, h.phone, h.distance_km, h
     return c
 
 
@@ -133,7 +156,8 @@ async def read_calls(run: agent.Run, batch: list[agent.Candidate]) -> dict[int, 
                 'Reply JSON: {"calls":[{"id":int,"available":bool|null,"nightly_price":number|null,'
                 '"total_price":number|null,"taxes_included":bool|null,"fees":str|null,"room_type":str|null,'
                 '"check_in":"YYYY-MM-DD"|null,"check_out":"YYYY-MM-DD"|null,"cancellation":str|null,'
-                '"reference":str|null}]}. available=true only if the hotel confirmed a room for these dates.')},
+                '"reference":str|null,"summary":str}]}. available=true only if the hotel confirmed a room for these '
+                'dates. summary: what the hotel said, in at most 25 words.')},
             {"role": "user", "content": calls},
         ])
     except Exception as e:  # fall back to what the in-call LLM already collected
@@ -143,7 +167,8 @@ async def read_calls(run: agent.Run, batch: list[agent.Candidate]) -> dict[int, 
 
 
 def apply(run: agent.Run, c: agent.Candidate, x: dict | None):
-    """Transcript reading overrides the live call's guess; keep live facts it didn't cover."""
+    """Transcript reading overrides the live call's guess; keep live facts it didn't cover.
+    Also fills `c.call`, the CallQuery that the final sort reads."""
     if x:
         for k, v in (("available", x.get("available")), ("price", x.get("nightly_price")),
                      ("total", x.get("total_price")), ("taxes_included", x.get("taxes_included")),
@@ -160,16 +185,30 @@ def apply(run: agent.Run, c: agent.Candidate, x: dict | None):
                     else "unavailable" if f.get("available") is False or wrong_dates else "unclear")
     if c.status == "verified" and not c.verified_at:
         c.verified_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    if c.history:
+        c.call = CallQuery(transcript=transcript(run, c), call_url=call_url(c.sid), summary=(x or {}).get("summary") or "",
+                           price=quoted_total(run, c), available=False if wrong_dates else f.get("available"))
+        c.hotel.call_query = c.call
 
 
-def stay_cost(run: agent.Run, c: agent.Candidate) -> float:
-    """Quoted total, else quoted nightly x nights, else the listing (unconfirmed price sorts last)."""
-    f, n = c.facts, agent.nights(run.req)
+def quoted_total(run: agent.Run, c: agent.Candidate) -> float | None:
+    """What the hotel quoted for the whole stay: its total, else its nightly rate x nights."""
+    f = c.facts
     if isinstance(f.get("total"), (int, float)):
         return float(f["total"])
     if isinstance(f.get("price"), (int, float)):
-        return float(f["price"]) * n
-    return 1e9 + (c.total or c.price * n)
+        return float(f["price"]) * agent.nights(run.req)
+    return None
+
+
+def call_url(sid: str | None) -> str | None:
+    return f"https://console.twilio.com/us1/monitor/logs/calls/{sid}" if sid else None
+
+
+def stay_cost(run: agent.Run, c: agent.Candidate) -> float:
+    """Quoted stay price, else the listing (an unconfirmed price sorts last)."""
+    quoted = c.call.price if c.call else quoted_total(run, c)
+    return quoted if quoted is not None else 1e9 + (c.total or c.price * agent.nights(run.req))
 
 
 # ---------------------------------------------------------------- orchestration
@@ -180,19 +219,19 @@ async def run_pipeline(run: agent.Run) -> agent.Candidate | None:
         raise SystemExit("Could not find a city in the prompt.")
     print("request:", json.dumps(run.req), file=sys.stderr)
 
-    rows = await search(run.req)
-    run.cands = [candidate(i, r) for i, r in enumerate(rows)]
+    hotels = await search(run.req)
+    run.cands = [candidate(i, h, agent.nights(run.req)) for i, h in enumerate(hotels)]
     run.mark("search")
-    print(f"search:  {len(rows)} priced options", file=sys.stderr)
+    print(f"search:  {len(hotels)} priced options", file=sys.stderr)
 
     pool = list(run.cands)
     for rnd in range(1, MAX_ROUNDS + 1):
         batch = []
         while len(batch) < BATCH and pool:          # backfill past hotels with no phone
             take, pool = pool[:BATCH - len(batch)], pool[BATCH - len(batch):]
-            await asyncio.gather(*(phone(rows[c.idx], run.req) for c in take))
+            await asyncio.gather(*(phone(c.hotel, run.req) for c in take))
             for c in take:
-                c.phone, c.address = rows[c.idx]["phone"], rows[c.idx]["address"] or c.address
+                c.phone, c.address = c.hotel.phone, c.hotel.address or c.address
                 if c.phone or agent.PHONE_OVERRIDE:
                     batch.append(c)
                 else:
@@ -206,11 +245,11 @@ async def run_pipeline(run: agent.Run) -> agent.Candidate | None:
         facts = await read_calls(run, batch)
         for c in batch:
             apply(run, c, facts.get(c.idx))
-        ok = sorted((c for c in batch if c.status == "verified"), key=lambda c: stay_cost(run, c))
+        best = ranker.cheapest([c.hotel for c in batch])    # confirmed rooms only, cheapest quote first
         run.mark(f"round{rnd}")
-        if ok:
-            run.winner = ok[0]
-            return ok[0]
+        if best:
+            run.winner = next(c for c in batch if c.hotel is best)
+            return run.winner
     return None
 
 
@@ -222,10 +261,11 @@ def report(run: agent.Run) -> dict:
         "winner": ({**run.winner.summary(), "stay_cost": stay_cost(run, run.winner)}
                    if run.winner else None),
         "called": [{"name": c.name, "listed_night": c.price, "status": c.status, "phone": c.phone,
+                    "distance_km": c.km, "summary": c.call.summary if c.call else None,
                     "quoted_night": c.facts.get("price"),
                     "quoted_total": c.facts.get("total") or (c.facts.get("price") or 0) * n or None,
                     "room_type": c.facts.get("room_type"), "fees": c.facts.get("fees"),
-                    "transcript": transcript(run, c) if c.history else None} for c in called],
+                    "transcript": c.call.transcript if c.call else None} for c in called],
         "timings_s": run.marks,
         "llm": {"calls": run.llm_calls, "tokens_in": run.tok_in, "tokens_out": run.tok_out},
         "requests": dict(hs.COUNT),
@@ -247,6 +287,18 @@ def preflight(calling: bool = True):
         print("[preflight] PUBLIC_URL is empty: no /turn webhooks, calls go nowhere.", file=sys.stderr)
 
 
+def hotel_table(hotels: list[Hotel], req: dict) -> str:
+    if not hotels:
+        return "No matching rates."
+    out = [f"{'#':>2}  {'hotel':<40} {'total':>9} {'/night':>8} {'km':>6} {'src':<8} phone"]
+    n = agent.nights(req)
+    for i, h in enumerate(hotels, 1):
+        km = f"{h.distance_km:.1f}" if h.distance_km is not None else "-"
+        out.append(f"{i:>2}  {h.name[:40]:<40} {h.price:>9.2f} {h.price / n:>8.2f} {km:>6} {h.source:<8} {h.phone or '-'}")
+    out.append(f"prices in {agent.CURRENCY}; total for {n} night(s)")
+    return "\n".join(out)
+
+
 async def list_only(prompt: str, top: int = 10):
     """Parse + search + phones, print the table, phone nobody."""
     preflight(calling=False)
@@ -255,9 +307,9 @@ async def list_only(prompt: str, top: int = 10):
     try:
         run.req = await parse(prompt)
         print("request:", json.dumps(run.req))
-        rows = (await search(run.req))[:top]
-        await asyncio.gather(*(phone(r, run.req) for r in rows))
-        print(hs.table(rows))
+        hotels = (await search(run.req))[:top]
+        await asyncio.gather(*(phone(h, run.req) for h in hotels))
+        print(hotel_table(hotels, run.req))
         print(f"radius {RADIUS_KM:g} km from {run.req['city']} centre | llm {run.llm_calls} call(s), "
               f"{run.tok_in}/{run.tok_out} tokens | requests {hs.COUNT}")
     finally:

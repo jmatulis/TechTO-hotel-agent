@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import math
 import os
 import re
 import sys
@@ -27,6 +26,7 @@ from datetime import date, timedelta
 
 import httpx
 
+from ranker import distance_km as km
 from schemas import Hotel, HotelQuery
 
 try:
@@ -95,14 +95,6 @@ def serp_cheapest(props: list, nights: int) -> list[dict]:
 
 # ---------------------------------------------------------------- radius
 LATLNG_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$")
-
-
-def km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """Great-circle distance (haversine)."""
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    a = (math.sin((p2 - p1) / 2) ** 2
-         + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lng2 - lng1) / 2) ** 2)
-    return 6371.0 * 2 * math.asin(math.sqrt(a))
 
 
 async def geocode(near: str, city: str) -> tuple[float, float]:
@@ -235,10 +227,12 @@ def to_hotel(row: dict) -> Hotel:
                  review_rating=row.get("rating"), review_count=row.get("reviews"))
 
 
-async def find_hotels(query: HotelQuery | None = None, **fields) -> list[Hotel]:
+async def find_hotels(query: HotelQuery | None = None, *, phones: bool = True, pages: int = 1,
+                      **fields) -> list[Hotel]:
     """Same contract as liteapi_search.find_hotels: the `limit` cheapest hotels within `radius_m`
-    of the city centre, cheapest first, with phones. Costs 1 hotels search + 1 geocode
-    + 1 details search per hotel returned. Needs SERPAPI_KEY."""
+    of the city centre, cheapest first. `phones` costs 1 details search per hotel returned;
+    off, phones stay None for the caller to look up. Costs 1 hotels search + 1 geocode per page.
+    Needs SERPAPI_KEY."""
     global HTTP
     q = query or HotelQuery(**fields)
     nights = max(1, (q.check_out - q.check_in).days)
@@ -247,7 +241,7 @@ async def find_hotels(query: HotelQuery | None = None, **fields) -> list[Hotel]:
         HTTP = httpx.AsyncClient(http2=True, timeout=15)
     try:
         rows = await search(q.city, q.check_in.isoformat(), nights, q.adults * q.rooms, q.limit,
-                            phones=True, near=q.city, radius_km=q.radius_m / 1000)
+                            phones=phones, near=q.city, radius_km=q.radius_m / 1000, pages=pages)
     finally:
         if own:
             await HTTP.aclose()

@@ -8,25 +8,17 @@ each hotel's phone number and reviews, in parallel.
     hotels = await find_hotels(city="Toronto", adults=1, radius_m=10_000)
 """
 import asyncio
-import math
 import os
 
 import httpx
 from dotenv import load_dotenv
 
+from ranker import distance_km
 from schemas import Hotel, HotelQuery
 
 load_dotenv()
 LITE_URL = "https://api.liteapi.travel/v3.0/hotels/rates"
 PLACES_URL = "https://places.googleapis.com/v1/places:searchText"
-
-
-def _distance_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """Great-circle (haversine) distance."""
-    p = math.pi / 180
-    a = (math.sin((lat2 - lat1) * p / 2) ** 2
-         + math.cos(lat1 * p) * math.cos(lat2 * p) * math.sin((lng2 - lng1) * p / 2) ** 2)
-    return 12742 * math.asin(math.sqrt(a))
 
 
 async def _city_center(http: httpx.AsyncClient, q: HotelQuery) -> tuple[float, float]:
@@ -56,7 +48,7 @@ async def _priced_hotels(http: httpx.AsyncClient, q: HotelQuery, lat: float, lng
         h, room = info.get(row["hotelId"]), (row.get("roomTypes") or [None])[0]
         if not h or not room or h.get("latitude") is None:
             continue
-        dist = _distance_km(lat, lng, h["latitude"], h["longitude"])
+        dist = distance_km(lat, lng, h["latitude"], h["longitude"])
         if dist * 1000 > q.radius_m:
             continue
         price = room["offerRetailRate"]
