@@ -590,13 +590,41 @@ async def t_pipeline():
     print("ok  pipeline preflight: empty/dead/5xx tunnel caught before dialing")
 
 
+async def t_prompt_email():
+    """The address typed in the prompt wins over the LLM's copy and JUDGE_EMAIL; no address -> JUDGE_EMAIL."""
+    import pipeline as pl
+
+    async def fake_llm(m):      # the model "misreads" the address
+        return {"city": "Toronto", "check_in": "2026-10-18", "check_out": "2026-10-19", "adults": 2,
+                "email": "wrong@llm.example"}
+
+    saved = (agent.llm, agent.JUDGE_EMAIL)
+    agent.llm, agent.JUDGE_EMAIL = fake_llm, "fallback@techto.ca"
+    agent.RUN = agent.Run("x")
+    try:
+        req = await pl.parse("King room in Toronto Oct 18, send it to Judge.Name+1@Example.co.uk.")
+        assert req["email"] == "Judge.Name+1@Example.co.uk", req["email"]
+        req = await pl.parse("King room in Toronto Oct 18")
+        assert req["email"] in ("wrong@llm.example", "fallback@techto.ca"), req["email"]
+        agent.llm = lambda m: _empty()
+        req = await pl.parse("King room in Toronto Oct 18")
+        assert req["email"] == "fallback@techto.ca", req["email"]
+    finally:
+        agent.llm, agent.JUDGE_EMAIL = saved
+    print("ok  email address comes from the prompt (regex), JUDGE_EMAIL only as the fallback")
+
+
+async def _empty():
+    return {}
+
+
 async def t_mailer():
     """Format from plain dicts (organizers' subject with TEAM_NUMBER); Resend vs SMTP routing."""
     import mailer
 
     req = {"city": "Whitby", "check_in": "2026-10-18", "check_out": "2026-10-20", "nights": 2,
            "adults": 2, "room_type": "king"}
-    win = {"name": "Quality Suites Whitby", "address": "1700 Champlain Ave, Whitby, ON", "km": 4.66,
+    win = {"name": "Quality Suites Whitby", "summary": "King room free, 119 a night plus HST.", "address": "1700 Champlain Ave, Whitby, ON", "km": 4.66,
            "phone": "+19054328800", "listed_night": 127, "quoted_night": 119, "fees": "13% HST",
            "room_type": "King", "reference": "QS4471", "status": "verified",
            "transcript": "Agent: Do you have a king room?\nHotel: Yes, 119 a night.<script>"}
@@ -611,13 +639,17 @@ async def t_mailer():
         for want in ("Hotel name: Quality Suites Whitby", "Address: 1700 Champlain Ave", "4.7 km from city centre",
                      "Reservation #: QS4471", "$119.00 CAD", "Total for the stay: $238.00 CAD",
                      "Reservation dates: 2026-10-18 to 2026-10-20 (2 nights)", "Hotel: Yes, 119 a night.",
-                     "CALL TRANSCRIPT: Spark Oshawa", "Hotel: We're full.", "No availability"):
+                     "WHAT THE HOTEL SAID", "CALL TRANSCRIPT"):
             assert want in text, (want, text)
+        assert "Spark Oshawa" not in text and "Spark Oshawa" not in html, "only the cheapest hotel is listed"
+        assert "We're full" not in text and "HOTELS TRIED" not in text
         assert "<script>" not in html and "&lt;script&gt;" in html, "transcript must be escaped"
-        assert text.index("Quality Suites Whitby") < text.index("CALL TRANSCRIPT: Spark"), "winner first"
+        assert "tel:+19054328800" in html and "Room confirmed by phone" in html and "$238.00 CAD" in html
         mailer.TEAM_NUMBER = ""
-        subject, _, _ = mailer.build(req, None, [other])
+        subject, text, html = mailer.build(req, None, [other])
         assert subject == "No hotel could be confirmed in Whitby", subject
+        assert "HOTELS TRIED" in text and "Spark Oshawa | No availability" in text, text
+        assert "No room could be confirmed" in html
 
         sent = []
 
@@ -761,6 +793,7 @@ async def t_recording():
 
 async def main():
     await t_recording()
+    await t_prompt_email()
     await t_mailer()
     await t_hotel_search()
     await t_pipeline()

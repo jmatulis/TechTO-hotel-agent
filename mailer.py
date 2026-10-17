@@ -42,6 +42,8 @@ SMTP_HOST = E("SMTP_HOST", "smtp.gmail.com")
 SMTP_USER = E("SMTP_USER")
 SMTP_PASS = E("SMTP_PASS")                         # Gmail app password
 
+FOOTER = "Rate and availability confirmed by an automated phone call. No payment was taken."
+
 STATUS_TEXT = {"verified": "Confirmed available", "unavailable": "No availability",
                "unclear": "Could not confirm", "no_answer": "No answer / busy",
                "unreachable": "Call failed", "timeout": "Call timed out", "no_phone": "No phone listed",
@@ -91,8 +93,13 @@ def stay_total(req: dict, h: dict):
 
 def build(req: dict, winner: dict | None, options: list[dict], stats: dict | None = None
           ) -> tuple[str, str, str]:
-    """-> (subject, plain text, html). `req`: city, check_in, check_out, nights, adults, room_type."""
+    """-> (subject, plain text, html). `req`: city, check_in, check_out, nights, adults, room_type.
+
+    With a `winner`, the email is about that one hotel: price, details, what it said on the call,
+    and the call transcript as a chat. `options` is only listed (briefly) when nobody confirmed.
+    `stats` is accepted for compatibility and not shown."""
     w = winner
+    n = req.get("nights") or 1
     if w:
         subject = (f"Team # {TEAM_NUMBER} - Hotel Reservation Confirmed!" if TEAM_NUMBER else
                    f"Hotel confirmed: {w.get('name')}, {req.get('city')}, "
@@ -101,66 +108,110 @@ def build(req: dict, winner: dict | None, options: list[dict], stats: dict | Non
         subject = ((f"Team # {TEAM_NUMBER} - " if TEAM_NUMBER else "")
                    + f"No hotel could be confirmed in {req.get('city')}")
 
-    summary = [("Guest", GUEST_NAME), ("City", req.get("city")),
-               ("Reservation dates", f"{req.get('check_in')} to {req.get('check_out')} "
-                                     f"({req.get('nights') or 1} night{'s' * ((req.get('nights') or 1) > 1)})"),
-               ("Guests", req.get("adults")), ("Room requested", req.get("room_type") or "any")]
-    hotel = []
-    if w:
-        hotel = [
-            ("Hotel name", w.get("name")),
-            ("Address", w.get("address") or "n/a"),
-            ("Distance", dist(w.get("km"))),
-            ("Phone", w.get("phone") or "n/a"),
-            ("Reservation #", w.get("reference") or "none given on the call"),
-            ("Nightly rate (quoted on the call)", money(w.get("quoted_night"))),
-            ("Total for the stay", money(stay_total(req, w))),
-            ("Nightly rate (listed online)", money(w.get("listed_night"))),
-            ("Taxes / fees", w.get("fees") or "not stated"),
-            ("Room type", w.get("room_type") or "not stated"),
-            ("Cancellation", w.get("cancellation") or "not stated"),
-            ("Confirmed at", w.get("verified_at") or "n/a"),
-        ]
-    opts = [(o.get("name"), dist(o.get("km")).replace(" from city centre", ""),
-             money(o.get("listed_night")), money(o.get("quoted_night")),
-             STATUS_TEXT.get(o.get("status"), o.get("status") or "n/a"), o.get("phone") or "n/a")
-            for o in options]
-    head = ("Hotel", "Distance", "Listed /night", "Quoted /night", "Result", "Phone")
-    stat_rows = [(k, v) for k, v in (stats or {}).items()]
+    stay = [("Guest", GUEST_NAME),
+            ("Reservation dates", f"{req.get('check_in')} to {req.get('check_out')} "
+                                  f"({n} night{'s' * (n > 1)})"),
+            ("Guests", req.get("adults")), ("Room requested", req.get("room_type") or "any")]
+    total = stay_total(req, w) if w else None
+    hotel = [] if not w else [
+        ("Hotel name", w.get("name")),
+        ("Address", w.get("address") or "n/a"),
+        ("Phone", w.get("phone") or "n/a"),
+        ("Distance", dist(w.get("km"))),
+        ("Reservation #", w.get("reference") or "none given on the call"),
+        ("Total for the stay", money(total)),
+        ("Nightly rate (quoted on the call)", money(w.get("quoted_night"))),
+        ("Nightly rate (listed online)", money(w.get("listed_night"))),
+        ("Taxes / fees", w.get("fees") or "not stated"),
+        ("Room type", w.get("room_type") or "not stated"),
+        ("Cancellation", w.get("cancellation") or "not stated"),
+        ("Confirmed at", w.get("verified_at") or "n/a"),
+    ]
+    chat = lines(w.get("transcript")) if w else []
+    said = (w or {}).get("summary") or ""
+    tried = [(o.get("name"), STATUS_TEXT.get(o.get("status"), o.get("status") or "n/a"), o.get("phone") or "n/a")
+             for o in options] if not w else []
 
     # ---- plain text
     t = [subject, ""]
-    t += [f"{k}: {v}" for k, v in summary + hotel]
-    t += ["", "EVERY OPTION CHECKED"] + [" | ".join(map(str, r)) for r in [head] + opts]
-    for o in [w] + [o for o in options if o is not w] if w else options:
-        if o and lines(o.get("transcript")):
-            t += ["", f"CALL TRANSCRIPT: {o.get('name')}"]
-            t += [f"{who}: {said}" for who, said in lines(o.get("transcript"))]
-    if stat_rows:
-        t += ["", "RUN STATS"] + [f"{k}: {v}" for k, v in stat_rows]
+    t += [f"{k}: {v}" for k, v in stay + hotel]
+    if said:
+        t += ["", "WHAT THE HOTEL SAID", said]
+    if chat:
+        t += ["", "CALL TRANSCRIPT"] + [f"{who}: {txt}" for who, txt in chat]
+    if tried:
+        t += ["", "HOTELS TRIED"] + [" | ".join(map(str, r)) for r in tried]
+    t += ["", FOOTER]
     text = "\n".join(map(str, t))
 
-    # ---- html
-    def table(rows, header=None):
-        cell = "padding:6px 10px;border:1px solid #ddd;text-align:left;vertical-align:top"
-        h = ("<tr>" + "".join(f"<th style='{cell};background:#f4f4f4'>{escape(str(x))}</th>"
-                              for x in header) + "</tr>") if header else ""
-        body = "".join("<tr>" + "".join(f"<td style='{cell}'>{escape(str(x))}</td>" for x in r) + "</tr>"
-                       for r in rows)
-        return f"<table style='border-collapse:collapse;font:14px sans-serif'>{h}{body}</table>"
+    # ---- html (inline styles, one 600px column: renders the same in Gmail, Outlook, Apple Mail)
+    font = "font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif"
+    cell = f"padding:7px 0;border-bottom:1px solid #eee;{font};font-size:14px;vertical-align:top"
 
-    html = [f"<h2 style='font-family:sans-serif'>{escape(subject)}</h2>", table(summary)]
-    if hotel:
-        html += ["<h3 style='font-family:sans-serif'>Confirmed hotel</h3>", table(hotel)]
-    html += ["<h3 style='font-family:sans-serif'>Every option checked</h3>", table(opts, head)]
-    for o in [w] + [o for o in options if o is not w] if w else options:
-        if o and lines(o.get("transcript")):
-            html.append(f"<h3 style='font-family:sans-serif'>Call transcript: {escape(str(o.get('name')))}</h3>")
-            html += [f"<p style='font:14px sans-serif;margin:4px 0'><b>{escape(who)}:</b> {escape(said)}</p>"
-                     for who, said in lines(o.get("transcript"))]
-    if stat_rows:
-        html += ["<h3 style='font-family:sans-serif'>Run stats</h3>", table(stat_rows)]
-    return subject, text, "".join(html)
+    def rows(items):
+        return "<table width='100%' style='border-collapse:collapse'>" + "".join(
+            f"<tr><td style='{cell};color:#666;width:42%'>{escape(str(k))}</td>"
+            f"<td style='{cell};color:#111'>{v}</td></tr>" for k, v in items) + "</table>"
+
+    def h3(label):
+        return (f"<div style='{font};font-size:12px;letter-spacing:.06em;text-transform:uppercase;"
+                f"color:#666;margin:26px 0 8px'>{label}</div>")
+
+    if w:
+        phone = w.get("phone")
+        tel = (f"<a href='tel:{escape(str(phone))}' style='color:#0b57d0;text-decoration:none'>"
+               f"{escape(str(phone))}</a>") if phone else "n/a"
+        nightly = w.get("quoted_night")
+        sub = (f"{money(nightly)} per night &times; {n} night{'s' * (n > 1)}" if isinstance(nightly, (int, float))
+               and total is not None and not isinstance(w.get("quoted_total"), (int, float))
+               else "quoted for the whole stay")
+        facts = [("Address", escape(str(w.get("address") or "n/a"))), ("Phone", tel),
+                 ("Distance", escape(dist(w.get("km")))),
+                 ("Room", escape(str(w.get("room_type") or req.get("room_type") or "not stated"))),
+                 ("Taxes / fees", escape(str(w.get("fees") or "not stated"))),
+                 ("Cancellation", escape(str(w.get("cancellation") or "not stated"))),
+                 ("Reservation #", escape(str(w.get("reference") or "none given on the call"))),
+                 ("Listed online", escape(money(w.get("listed_night")) + " per night")),
+                 ("Confirmed at", escape(str(w.get("verified_at") or "n/a")))]
+        banner = ("<div style='background:#e6f4ea;color:#137333;padding:10px 20px;font-weight:600;"
+                  f"{font};font-size:14px'>&#10003; Room confirmed by phone</div>")
+        head = (f"<div style='padding:22px 20px 6px'><div style='{font};font-size:22px;font-weight:700;"
+                f"color:#111'>{escape(str(w.get('name')))}</div>"
+                f"<div style='{font};font-size:14px;color:#555;margin-top:4px'>{escape(str(req.get('city')))}"
+                f" &middot; {escape(str(req.get('check_in')))} to {escape(str(req.get('check_out')))}"
+                f" &middot; {req.get('adults')} guest{'s' * ((req.get('adults') or 1) > 1)}</div></div>"
+                f"<div style='padding:6px 20px 0'><div style='{font};font-size:34px;font-weight:700;color:#111'>"
+                f"{escape(money(total))}</div>"
+                f"<div style='{font};font-size:13px;color:#666'>{sub}</div></div>")
+        body = [rows(facts)]
+        if said:
+            body += [h3("What the hotel said"),
+                     f"<div style='{font};font-size:14px;color:#222;background:#f6f8fa;border-left:3px solid #137333;"
+                     f"padding:10px 14px'>{escape(said)}</div>"]
+        if chat:
+            body.append(h3("Call transcript"))
+            for who, txt in chat:
+                hotel_side = who.lower().startswith("hotel")
+                body.append(
+                    f"<div style='text-align:{'right' if hotel_side else 'left'};margin:6px 0'>"
+                    f"<div style='{font};font-size:11px;color:#888;margin-bottom:2px'>{escape(who)}</div>"
+                    f"<span style='display:inline-block;max-width:80%;text-align:left;{font};font-size:14px;"
+                    f"padding:8px 12px;border-radius:14px;"
+                    f"background:{'#d2e3fc' if hotel_side else '#eceff1'};color:#111'>{escape(txt)}</span></div>")
+        inner = banner + head + "<div style='padding:14px 20px 4px'>" + "".join(body) + "</div>"
+    else:
+        banner = ("<div style='background:#fef7e0;color:#b06000;padding:10px 20px;font-weight:600;"
+                  f"{font};font-size:14px'>No room could be confirmed</div>")
+        listing = rows([(escape(str(a)), f"{escape(str(b))} &middot; {escape(str(c))}") for a, b, c in tried])
+        inner = (banner + f"<div style='padding:20px'><div style='{font};font-size:14px;color:#333'>"
+                 f"Nobody we phoned in {escape(str(req.get('city')))} confirmed a room for "
+                 f"{escape(str(req.get('check_in')))} to {escape(str(req.get('check_out')))}.</div>"
+                 + (h3("Hotels tried") + listing if tried else "") + "</div>")
+    html = (f"<div style='background:#f1f3f4;padding:20px 8px'><div style='max-width:600px;margin:0 auto;"
+            f"background:#fff;border-radius:10px;overflow:hidden'>{inner}"
+            f"<div style='{font};font-size:12px;color:#888;padding:14px 20px 20px'>{escape(FOOTER)}</div>"
+            "</div></div>")
+    return subject, text, html
 
 
 # ---------------------------------------------------------------- sending

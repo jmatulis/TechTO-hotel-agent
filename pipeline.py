@@ -73,8 +73,11 @@ async def parse(prompt: str) -> dict:
         cout = cin
     if cout <= cin:
         cout = cin + timedelta(days=1)
+    # the address typed in the prompt wins, exactly as written; the LLM's copy and JUDGE_EMAIL are fallbacks
+    m = agent.EMAIL_RE.search(prompt)
+    prompt_email = m.group(0).rstrip(".") if m else None
     req.update(check_in=cin.isoformat(), check_out=cout.isoformat(), adults=int(req["adults"] or 1),
-               email=req["email"] or agent.JUDGE_EMAIL)
+               email=prompt_email or req["email"] or agent.JUDGE_EMAIL)
     return req
 
 
@@ -311,6 +314,7 @@ def email_items(run: agent.Run) -> tuple[dict, dict | None, list[dict], dict]:
                 "listed_night": c.price, "quoted_night": f.get("price"), "quoted_total": f.get("total"),
                 "fees": f.get("fees"), "room_type": f.get("room_type"), "cancellation": f.get("cancellation"),
                 "reference": f.get("reference"), "status": c.status, "verified_at": c.verified_at,
+                "summary": c.call.summary if c.call else "",
                 "transcript": transcript(run, c) if c.history else None}
 
     called = [c for c in run.cands if c.attempts or c.status == "no_phone"]
