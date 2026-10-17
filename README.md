@@ -1,1 +1,158 @@
-# TechTO-hotel-agent
+# Fast & Frugal Hotel Agent v2 — TechTO Hackathon (Oct 17, 2026)
+
+One Python process, one asyncio event loop, no agent frameworks, no browser automation.
+The agent finds the best-value hotels, **phones the top few at the same time to verify the room
+is real and available at the listed price**, picks the best verified one, and emails a full
+confirmation record. The LLM is only used for the phone conversations (and for prompts that regex
+can't read); everything else is deterministic.
+
+## Blueprint
+
+```
+judge prompt
+   │
+   ▼
+[1] parse_request()     regex fast path, 0 tokens; LLM fallback only for fuzzy dates
+   ▼
+[2] search_hotels()     ONE SerpApi google_hotels call: cheapest first, rating ≥3.5
+   ▼
+[3] rank()              price × rating penalty, 0 tokens
+   ▼
+[4] pick_shortlist()    phone + address for the top K (parallel SerpApi lookups);
+                        a hotel with no phone is skipped and the next one is pulled in
+   ▼
+[5] verify_all()        calls the top K AT THE SAME TIME
+   │   ┌─ call 1 ─┐ ┌─ call 2 ─┐ ┌─ call 3 ─┐   each: Twilio <Gather> STT → POST /turn?c=i
+   │   │ verify   │ │ verify   │ │ verify   │         → LLM (JSON) → Twilio <Say> TTS
+   │   └──────────┘ └──────────┘ └──────────┘
+   │   decide(): walk in rank order; the first VERIFIED hotel wins as soon as every
+   │   better-ranked one has failed → remaining calls are hung up immediately
+   ▼
+[6] send_receipt()      winner details + every option checked + call transcript
+```
+
+### What each call verifies
+
+Availability for the exact dates and guest count, the nightly rate, taxes/fees, room type and
+cancellation policy, plus the staff member's name and any reference number they give. The agent
+introduces itself as an automated assistant, never shares payment details, and by default does not
+reserve anything (`HOLD_ON_CALL=1` lets it accept a hold under the guest's name).
+
+### Call outcomes
+
+| Status                  | Meaning                                                              |
+| ----------------------- | -------------------------------------------------------------------- |
+| `verified`              | Hotel confirmed a room is available                                  |
+| `unavailable`           | Hotel said no rooms; call ends right away                            |
+| `unclear`               | Call finished without a clear answer (silence, hang-up, turn limit)  |
+| `no_answer`             | Busy or no answer, even after a redial                               |
+| `unreachable` / `error` | Twilio couldn't place the call                                       |
+| `timeout`               | Ran past `CALL_TIMEOUT`; the agent hangs up                          |
+| `cancelled`             | A better-ranked hotel was verified first, so this call was cut short |
+| `no_phone`              | No phone number found; never called                                  |
+
+### The confirmation email
+
+Everything the guest might need later, in both HTML and plain text:
+
+- **The booking:** hotel, address, phone, dates, nights, guests, guest name
+- **Price:** the rate confirmed by phone _and_ the listed rate, estimated total, taxes/fees
+- **Terms:** room type, cancellation policy, check-in/check-out times
+- **Proof:** who confirmed it, any reference number, when it was verified, and the booking link
+- **Every option checked,** with its result and phone number, so the user has backups
+- **The full call transcript**
+- **Cost stats:** agent time, tokens, call minutes
+
+If nothing could be verified, the email still goes out marked `[NOT VERIFIED]`, with every option checked.
+
+### Why it's fast and cheap
+
+| Choice                                               | Saves                                                           |
+| ---------------------------------------------------- | --------------------------------------------------------------- |
+| Parallel verification calls                          | Total call time ≈ the slowest needed call, not the sum          |
+| Early stop + Twilio hang-up                          | Stops paying for call minutes the moment the outcome is decided |
+| "No availability" ends the call at once              | No wasted turns on dead options                                 |
+| Regex parse, deterministic ranking, templated opener | Zero tokens outside the conversations                           |
+| Inline `Twiml` on call create                        | No webhook round trip before the hotel hears anything           |
+| History capped at 6 messages, `max_tokens=110`       | Flat token cost per turn                                        |
+| HTTP/2 + pre-warmed connections                      | TLS handshakes off the critical path                            |
+
+## API payloads
+
+**SerpApi search** (`GET https://serpapi.com/search.json`)
+
+```
+engine=google_hotels q="hotels in Toronto" check_in_date check_out_date adults currency=CAD gl=ca
+sort_by=3 rating=7 api_key
+```
+
+**SerpApi property details** (same params + `property_token`) → `phone`, `address`, `link`,
+`check_in_time`, `check_out_time`. Fallback: `engine=google_maps type=search q="<hotel>, <city>"` →
+`place_results.phone` or `local_results[0].phone`.
+
+**Twilio create call** (`POST /2010-04-01/Accounts/{SID}/Calls.json`)
+
+```
+To=<hotel phone or PHONE_OVERRIDE>  From=<your Twilio number>
+Twiml=<Response><Gather input="speech" action="{PUBLIC_URL}/turn?c=2" …><Say>opener</Say></Gather></Response>
+StatusCallback={PUBLIC_URL}/status?c=2  StatusCallbackEvent=completed  Timeout=20
+```
+
+The `?c=<index>` on both URLs is how the server knows which hotel's conversation a webhook belongs to.
+
+**Twilio hang-up** (`POST …/Calls/{CallSid}.json`, `Status=completed`) is used for early stop and timeouts.
+
+**LLM reply contract**
+
+```json
+{
+  "say": "And what's the cancellation policy?",
+  "done": false,
+  "available": true,
+  "price": 115,
+  "fees": "13% HST",
+  "room_type": "Queen",
+  "cancellation": null,
+  "check_in_time": null,
+  "reference": null,
+  "staff_name": null
+}
+```
+
+## Setup
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env              # fill in keys
+cloudflared tunnel --url http://localhost:8080   # or: ngrok http 8080 → put URL in PUBLIC_URL
+python test_agent.py              # offline tests, no keys needed
+python agent.py "Find the best hotel deal in Toronto for 2026-10-18 to 2026-10-19, send to judge@x.com"
+```
+
+## Testing with your own phone
+
+Set `PHONE_OVERRIDE=<your cell>`. Every call goes to you, **one at a time, best-ranked first**, and
+the run stops at the first one you verify. To demo the multi-call flow, answer the first call
+with "sorry, we're fully booked", then confirm the second one.
+
+## Pre-bake-off checklist
+
+- [ ] Twilio account **upgraded** (trial accounts can only dial verified numbers, and they play a preamble)
+- [ ] Twilio Geo Permissions allow Canada/US
+- [ ] Confirm the current Groq model ID (`LLM_MODEL`)
+- [ ] SerpApi credits: each run uses about 1 + K lookups (a few more if hotels lack phone numbers)
+- [ ] Tunnel up, and `PUBLIC_URL` matches it
+- [ ] Test receipt lands in the inbox, not spam
+- [ ] One real end-to-end test with `PHONE_OVERRIDE`
+- [ ] Ask the organizers: do agents call the real hotels, or a judge-run line? If it's one line,
+      set `PHONE_OVERRIDE` to it (calls then go out one at a time so they don't collide)
+
+## Known risks
+
+- **Calling real hotels:** the agent says it's automated and doesn't reserve anything by default,
+  but you're still placing AI calls to real businesses. Confirm with the organizers that this is expected.
+- **Phone menus and voicemail** ("press 1 for reservations") aren't handled; those calls end as `unclear`.
+- **Missing phone numbers:** if SerpApi has no phone for a hotel, it's skipped and backfilled.
+- **Ranking is by listed price:** if the confirmed rate differs, the email shows both,
+  but the winner is still chosen by listing rank.
+- **One booking per process** (global `RUN`), which is all the bake-off needs.
