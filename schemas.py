@@ -42,9 +42,9 @@ class Hotel(BaseModel):
     id: str
     name: str
     address: str | None = None
-    lat: float
-    lng: float
-    distance_km: float                   # from the city centre
+    lat: float | None = None
+    lng: float | None = None
+    distance_km: float | None = None     # from the city centre; None if unknown
     price: float                         # total for the stay, in the query currency
     currency: str
     rating: float | None = None          # LiteAPI scale, 0-10

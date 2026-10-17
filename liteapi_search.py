@@ -31,7 +31,7 @@ def _distance_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 
 async def _city_center(http: httpx.AsyncClient, q: HotelQuery) -> tuple[float, float]:
     r = await http.post(PLACES_URL, json={"textQuery": q.city, "regionCode": q.country, "pageSize": 1},
-                        headers={"X-Goog-Api-Key": os.environ["GOOGLE_PLATFORM_API_KEY"],
+                        headers={"X-Goog-Api-Key": os.environ["GOOGLE_PLACES_KEY"],
                                  "X-Goog-FieldMask": "places.location"})
     r.raise_for_status()
     places = r.json().get("places")
@@ -79,7 +79,7 @@ async def _add_phone(http: httpx.AsyncClient, hotel: Hotel, city: str) -> None:
                 "textQuery": f"{hotel.name}, {hotel.address}, {city}", "pageSize": 1,
                 "locationBias": {"circle": {"center": {"latitude": hotel.lat, "longitude": hotel.lng},
                                             "radius": 500.0}}},
-            headers={"X-Goog-Api-Key": os.environ["GOOGLE_PLATFORM_API_KEY"],
+            headers={"X-Goog-Api-Key": os.environ["GOOGLE_PLACES_KEY"],
                      "X-Goog-FieldMask": "places.displayName,places.internationalPhoneNumber,"
                                                 "places.rating,places.userRatingCount"})
         r.raise_for_status()
@@ -96,7 +96,7 @@ async def find_hotels(query: HotelQuery | None = None, **fields) -> list[Hotel]:
     """Return the `limit` cheapest hotels within `radius_m` of the city centre, cheapest first.
 
     Pass a HotelQuery, or its fields as keyword arguments (e.g. `city="Toronto", adults=1`).
-    Needs LITEAPI_API_KEY and GOOGLE_PLATFORM_API_KEY in the environment / .env.
+    Needs LITEAPI_API_KEY and GOOGLE_PLACES_KEY in the environment / .env.
     """
     q = query or HotelQuery(**fields)
     async with httpx.AsyncClient(timeout=30) as http:

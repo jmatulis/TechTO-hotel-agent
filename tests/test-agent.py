@@ -1,5 +1,10 @@
-"""Offline smoke tests: every outside service is faked. Run: python test-agent.py"""
+"""Offline smoke tests: every outside service is faked. Run: python tests/test-agent.py"""
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # project root, for agent.py etc.
 
 import asyncio
 

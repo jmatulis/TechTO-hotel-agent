@@ -11,7 +11,7 @@ from schemas import Hotel, RankWeights
 
 def score(h: Hotel, w: RankWeights) -> float:
     """price x (1 + distance penalty) x (1 + review penalty). Lower is better."""
-    dist = 1 + w.distance * min(h.distance_km / w.distance_ref_km, 1.0)
+    dist = 1 if h.distance_km is None else 1 + w.distance * min(h.distance_km / w.distance_ref_km, 1.0)
     trusted = h.review_rating is not None and (h.review_count or 0) >= w.min_reviews
     rev = 1 + w.review * max(0.0, w.review_target - h.review_rating) if trusted else 1.0
     return h.price * dist * rev

@@ -4,16 +4,20 @@ Call-path test: dials one hotel you invent, with no SerpApi and no email.
 Use it to tune the conversation without spending searches or sending mail. Needs a live
 tunnel in PUBLIC_URL and a phone in PHONE_OVERRIDE; everything else comes from .env.
 
-  python call_test.py                          # "Test Inn" at 129
-  python call_test.py "Good Value Inn" 149     # name and nightly rate
+  python tests/call_test.py                          # "Test Inn" at 129
+  python tests/call_test.py "Good Value Inn" 149     # name and nightly rate
 
 Answer the phone as a front desk would: "yes, we have a queen at 129 plus tax".
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # project root, for agent.py etc.
+
 import asyncio
 import json
-import sys
 
 import httpx
 import uvicorn
