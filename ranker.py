@@ -6,6 +6,7 @@
 
 Pure arithmetic: no API calls, no tokens.
 """
+from __future__ import annotations
 import math
 import re
 from difflib import SequenceMatcher

@@ -7,6 +7,7 @@ each hotel's phone number and reviews, in parallel.
     hotels = await find_hotels(HotelQuery(city="Toronto"))
     hotels = await find_hotels(city="Toronto", adults=1, radius_m=10_000)
 """
+from __future__ import annotations
 import asyncio
 import os
 

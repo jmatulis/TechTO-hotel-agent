@@ -1,5 +1,6 @@
 """Data models for hotel search: the query going in and the hotels coming out."""
 from datetime import date, timedelta
+from typing import Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -13,7 +14,7 @@ class HotelQuery(BaseModel):
     city: str
     country: str = "CA"                  # ISO-2; also used as guest nationality
     check_in: date = Field(default_factory=_tomorrow)
-    check_out: date | None = None        # defaults to check_in + 1 night
+    check_out: Optional[date] = None        # defaults to check_in + 1 night
     adults: int = 2                      # adults per room
     rooms: int = 1
     radius_m: int = 100_000              # search radius around the city centre
@@ -32,9 +33,9 @@ class CallQuery(BaseModel):
     """Outcome of phoning a hotel. `price` is the rate quoted on the call, used for the final sort."""
     transcript: str = ""
     summary: str = ""                    # one or two sentences
-    price: float | None = None
-    available: bool | None = None        # None until the call has a clear answer
-    call_url: str | None = None          # Twilio console page for this call (log, duration, cost)
+    price: Optional[float] = None
+    available: Optional[bool] = None        # None until the call has a clear answer
+    call_url: Optional[str] = None          # Twilio console page for this call (log, duration, cost)
 
 
 class Hotel(BaseModel):
@@ -42,21 +43,21 @@ class Hotel(BaseModel):
     source: str = "liteapi"              # which search found it (liteapi, serpapi, ...)
     id: str
     name: str
-    address: str | None = None
-    lat: float | None = None
-    lng: float | None = None
-    distance_km: float | None = None     # from the city centre; None if unknown
+    address: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    distance_km: Optional[float] = None     # from the city centre; None if unknown
     price: float                         # total for the stay, in the query currency
     currency: str
-    rating: float | None = None          # LiteAPI scale, 0-10
-    stars: float | None = None
-    refundable: bool | None = None
-    phone: str | None = None             # international format, from Google Places
-    places_name: str | None = None       # name Google matched; compare with `name` to spot bad matches
-    review_rating: float | None = None   # Google Places rating, 0-5
-    review_count: int | None = None      # number of Google reviews
-    score: float | None = None           # set by ranker.rank(); lower is better
-    call_query: CallQuery | None = None  # set after the phone call
+    rating: Optional[float] = None          # LiteAPI scale, 0-10
+    stars: Optional[float] = None
+    refundable: Optional[bool] = None
+    phone: Optional[str] = None             # international format, from Google Places
+    places_name: Optional[str] = None       # name Google matched; compare with `name` to spot bad matches
+    review_rating: Optional[float] = None   # Google Places rating, 0-5
+    review_count: Optional[int] = None      # number of Google reviews
+    score: Optional[float] = None           # set by ranker.rank(); lower is better
+    call_query: Optional[CallQuery] = None  # set after the phone call
 
 
 class RankWeights(BaseModel):
