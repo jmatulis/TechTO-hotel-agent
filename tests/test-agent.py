@@ -1074,8 +1074,8 @@ async def t_short_call():
     run = fresh()
     c = run.cands[0]
     op = agent.opener(run, c)
-    assert op.startswith("Hi, automated call. Do you have a room") and agent.GUEST_NAME not in op, op
-    assert len(op.split()) <= 25, f"opener too long: {len(op.split())} words"
+    assert op.startswith("Hi, this is an automated assistant with a quick availability question. Do you have a room"), op
+    assert agent.GUEST_NAME not in op and len(op.split()) <= 30, f"opener: {len(op.split())} words"
     sp = agent.system_prompt(run, c)
     assert "ONLY two facts" in sp and "Never ask about fees" in sp
 
@@ -1105,7 +1105,95 @@ async def t_short_call():
     print("ok  short call: no guest name, 2 facts only, 60s Twilio cap, hang up on confirmed price")
 
 
+async def t_repeat():
+    """'Sorry, can you repeat that?' replays our last line with no LLM call (max 2 times);
+    a real question ('what dates?') goes to the LLM, which answers then re-asks."""
+    run = fresh()
+    c = run.cands[0]
+    llm_calls = []
+
+    async def fake_llm(m):
+        llm_calls.append(m[-1]["content"])
+        return {"say": "October 18 to 20. Do you have a room at 110?", "done": False}
+
+    async def no_tts(text):
+        return None
+
+    for yes in ("Sorry, can you repeat that?", "Sorry?", "Hello?", "What?", "Pardon me", "I didn't catch that",
+                "Say that again please", "Come again?"):
+        assert agent.wants_repeat(yes), yes
+    for no in ("What dates was that for?", "Yes we have one at 110", "Sorry, we're fully booked",
+               "What we have is a king at 140 plus tax tonight only"):
+        assert not agent.wants_repeat(no), no
+
+    saved = (agent.llm, agent.tts)
+    try:
+        agent.llm, agent.tts = fake_llm, no_tts
+        cl = TestClient(agent.app)
+        op = agent.opener(run, c)
+        r = cl.post(f"/turn?c={c.idx}", data={"SpeechResult": "Hello?"})          # cut off mid-opener
+        assert op in r.text and "<Gather" in r.text and not llm_calls, r.text
+        r = cl.post(f"/turn?c={c.idx}", data={"SpeechResult": "What dates was that for?"})
+        assert llm_calls == ["What dates was that for?"] and "October 18" in r.text
+        r = cl.post(f"/turn?c={c.idx}", data={"SpeechResult": "Sorry, can you repeat that?"})
+        assert "October 18 to 20" in r.text and len(llm_calls) == 1, "replays the LAST line, no LLM"
+        r = cl.post(f"/turn?c={c.idx}", data={"SpeechResult": "Sorry?"})        # 3rd ask: LLM takes over
+        assert len(llm_calls) == 2 and c.repeats == agent.MAX_REPEATS
+        assert "re-ask your question" in agent.system_prompt(run, c)
+    finally:
+        agent.llm, agent.tts = saved
+    print("ok  repeat: replay last line on 'sorry?/repeat', no LLM, max 2; questions answered then re-asked")
+
+
+async def t_hold():
+    """'Hold on, let me check' -> 'Sure, take your time.' + a long silent listen. Silence while on
+    hold is not a failure and doesn't use up MAX_TURNS; after HOLD_CHECKS windows, a nudge that
+    asks for the single answer. Any speech ends the hold."""
+    run = fresh()
+    c = run.cands[0]
+    llm_calls = []
+
+    async def fake_llm(m):
+        llm_calls.append(m[-1]["content"])
+        return {"say": "Is that the lowest nightly price?", "done": False, "available": True}
+
+    async def no_tts(text):
+        return None
+
+    for yes in ("Hold on", "One moment please", "Let me check", "Can you hang on a sec?", "Just a minute",
+                "Bear with me", "Wait, let me look"):
+        assert agent.wants_wait(yes), yes
+    for no in ("Yes we have one at 110", "We checked and we're full", "Sorry?"):
+        assert not agent.wants_wait(no), no
+
+    saved = (agent.llm, agent.tts, agent.MAX_TURNS)
+    try:
+        agent.llm, agent.tts, agent.MAX_TURNS = fake_llm, no_tts, 4
+        cl = TestClient(agent.app)
+        r = cl.post(f"/turn?c={c.idx}", data={"SpeechResult": "Hold on, let me check."})
+        assert agent.WAIT_OK in r.text and f'timeout="{agent.HOLD_SECONDS}"' in r.text and c.holding
+        assert not llm_calls, "no LLM for a hold"
+        for _ in range(agent.HOLD_CHECKS):              # silence on hold: keep listening, say nothing
+            r = cl.post(f"/turn?c={c.idx}", data={})
+            assert "<Say" not in r.text and "<Play" not in r.text and f'timeout="{agent.HOLD_SECONDS}"' in r.text
+        assert c.silent == 0 and c.status != "unclear" and c.turns == 1, (c.silent, c.status, c.turns)
+        r = cl.post(f"/turn?c={c.idx}", data={})        # still nothing: polite nudge for the one answer
+        assert "Are you still there?" in r.text and "110 a night" in r.text and not c.holding, r.text
+        # the hold resumes on another "one moment", and real speech ends it and goes to the LLM
+        cl.post(f"/turn?c={c.idx}", data={"SpeechResult": "One moment."})
+        assert c.holding
+        r = cl.post(f"/turn?c={c.idx}", data={"SpeechResult": "OK we have a few rooms, it depends on the type."})
+        assert not c.holding and llm_calls and "<Gather" in r.text
+        sp = agent.system_prompt(run, c)
+        assert "patient" in sp and "ONE clear answer" in sp and "lowest nightly price" in sp
+    finally:
+        agent.llm, agent.tts, agent.MAX_TURNS = saved
+    print("ok  hold: 'hold on' -> wait quietly (no LLM, no turn cost), nudge after silence, prompt pushes one answer")
+
+
 async def main():
+    await t_hold()
+    await t_repeat()
     await t_short_call()
     await t_recording()
     await t_race()

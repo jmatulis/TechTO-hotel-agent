@@ -91,6 +91,9 @@ TWILIO_CONCURRENCY = int(E("TWILIO_CONCURRENCY", "5"))        # simultaneous cal
 CALL_TIMEOUT = float(E("CALL_TIMEOUT", "90"))         # a call still going after this is dropped
 CALL_MAX_SECONDS = int(E("CALL_MAX_SECONDS", "60"))   # Twilio hangs up after this long connected
 BYE = "Perfect, thanks. Goodbye."                     # fixed: its TTS is built once, reused every call
+WAIT_OK = "Sure, take your time."                     # fixed too: said when they ask us to hold
+HOLD_SECONDS = int(E("HOLD_SECONDS", "15"))           # silence we sit through per check while on hold
+HOLD_CHECKS = int(E("HOLD_CHECKS", "2"))              # silent hold windows before we gently nudge
 DIAL_RETRIES = int(E("DIAL_RETRIES", "0"))            # redials on busy / no answer; 0 = each hotel is dialed once
 RECORD_CALLS = E("RECORD_CALLS", "1") == "1"          # Twilio records each call; the winner's mp3 is emailed
 HOLD_ON_CALL = E("HOLD_ON_CALL", "0") == "1"          # 1 -> accept a hold/reservation if offered
@@ -106,6 +109,28 @@ SMTP_PASS = E("SMTP_PASS", "")                        # Gmail app password
 RETRYABLE = {"busy", "no-answer"}
 TERMINAL = {"verified", "unavailable", "unclear", "no_answer", "unreachable",
             "timeout", "no_phone", "duplicate", "cancelled", "error"}
+# "Sorry?", "can you repeat that?", "hello?" (often what an interrupted opener gets back).
+# Short replies only: a long sentence that happens to contain "what" is a real answer.
+REPEAT_RE = re.compile(
+    r"\b(repeat|again|pardon|didn'?t (catch|hear|get)|can'?t hear|excuse me|one more time|say what)\b"
+    r"|^(sorry|what|hello|huh|sorry what|hello hello)$", re.I)
+MAX_REPEATS = 2
+
+# "Hold on", "one moment", "let me check": they're working on it. Short replies only.
+WAIT_RE = re.compile(
+    r"\b(wait|hold on|hang on|one (moment|sec|second|minute)|just a (sec|second|minute|moment)|"
+    r"give me a (sec|second|minute|moment)|let me (check|see|look)|bear with me|checking)\b", re.I)
+
+
+def wants_wait(heard: str) -> bool:
+    return len(heard.split()) <= 10 and bool(WAIT_RE.search(heard))
+
+
+def wants_repeat(heard: str) -> bool:
+    words = re.sub(r"[^\w\s']", "", heard).strip()        # punctuation off: "Sorry?" -> "Sorry"
+    return len(words.split()) <= 7 and bool(REPEAT_RE.search(words))
+
+
 FACT_KEYS = ("available", "price", "fees", "room_type", "cancellation", "check_in_time",
              "reference", "staff_name")
 
@@ -141,6 +166,9 @@ class Candidate:
         self.local_seconds = 0    # our own dial-to-hangup measure, always available
         self.turns = 0
         self.silent = 0
+        self.repeats = 0          # times we replayed our last line on request
+        self.holding = False      # they asked us to wait: silence is expected, not a failure
+        self.waits = 0            # silent hold windows so far
         self.history: list = []
         self.facts: dict = {}
         self.verified_at = None
@@ -408,14 +436,15 @@ async def audio(key: str):
     return Response(content=AUDIO.get(key, b""), media_type="audio/mpeg")
 
 
-async def gather(c: Candidate, say: str) -> str:
+async def gather(c: Candidate, say: str, wait: int | None = None) -> str:
     """Twilio has no bargeIn attribute, so placement is the control: audio nested inside
     <Gather> is cut off by the first sound the hotel makes, audio before <Gather> always
     finishes and the Gather then only listens."""
     g = (f'<Gather input="speech" action="{PUBLIC_URL}/turn?c={c.idx}" method="POST" '
          f'speechTimeout="{SPEECH_TIMEOUT}" speechModel="phone_call" enhanced="true" '
-         f'actionOnEmptyResult="true" language="en-US">')
-    v = await voice_el(say)
+         f'actionOnEmptyResult="true" language="en-US"'
+         + (f' timeout="{wait}"' if wait else "") + ">")    # timeout: seconds to wait for speech to start
+    v = await voice_el(say) if say else ""
     body = f"{g}{v}</Gather>" if BARGE_IN else f"{v}{g}</Gather>"
     return f"<Response>{body}</Response>"
 
@@ -433,16 +462,17 @@ def nights(q: dict) -> int:
 
 
 def opener(run: Run, c: Candidate) -> str:
-    """One question, straight to the point: no guest name, no preamble beyond the two words
-    that say it's automated. With BARGE_IN=0 this plays uninterrupted, so every extra clause is
-    billed dead air. A 'yes' to this confirms availability AND the rate in one turn."""
+    """One clause of context so the front desk isn't caught off guard (who: an automated
+    assistant; why: a quick availability check), then ONE question. No guest name: it costs
+    seconds and they don't need it. A 'yes' confirms availability AND the rate in one turn."""
     q, n = run.req, nights(run.req)
     when = f"{date.fromisoformat(q['check_in']):%B %-d}"
     stay = when if n == 1 else f"{n} nights from {when}"
     room = f"{q['room_type']} room" if q.get("room_type") else "room"
     return (
-        f"Hi, automated call. Do you have a {room} available {stay} for "
-        f"{q['adults']} guest{'s' * (q['adults'] > 1)}, at {c.price:.0f} a night?"
+        f"Hi, this is an automated assistant with a quick availability question. "
+        f"Do you have a {room} available {stay} for {q['adults']} guest{'s' * (q['adults'] > 1)}, "
+        f"at {c.price:.0f} a night?"
     )
 
 
@@ -459,6 +489,11 @@ def system_prompt(run: Run, c: Candidate) -> str:
         "You need ONLY two facts: is a room available, and the nightly price. If they say yes to your "
         f"rate, price={c.price:.0f}. If one fact is missing, ask only for it in under 12 words. "
         "Never ask about fees, cancellation or anything else; no small talk, no restating. "
+        "If they ask you something (dates, guests, who is calling), answer in a few words from these "
+        "details, then re-ask your question. Be polite and patient, never rushed, but always steer "
+        "back to ONE clear answer: a yes or no on availability and a single nightly price. If they "
+        "give a range, several room types or 'it depends', ask for the lowest nightly price for those "
+        "dates. "
         f"{hold}Never share payment details. Never invent facts. "
         'Reply ONLY JSON: {"say":str (<=25 words, natural speech),"done":bool,"available":bool|null,'
         '"price":number|null,"fees":str|null,"room_type":str|null,"cancellation":str|null,'
@@ -506,6 +541,18 @@ async def _turn(request: Request, c: Candidate | None):
     heard = (form.get("SpeechResult") or "").strip()
     c.turns += 1
 
+    if not heard and c.holding:
+        # On hold: silence is them checking. Keep listening without a word, and don't let the
+        # wait eat into MAX_TURNS. After HOLD_CHECKS windows, a polite nudge back to the question.
+        c.turns -= 1
+        c.waits += 1
+        if c.waits <= HOLD_CHECKS:
+            return xml(await gather(c, "", wait=HOLD_SECONDS))
+        c.holding = False
+        nudge = f"Are you still there? I just need to know if a room is available at {c.price:.0f} a night."
+        c.history.append({"role": "assistant", "content": nudge})
+        return xml(await gather(c, nudge))
+
     if not heard:
         c.silent += 1
         if c.silent >= 2:
@@ -514,7 +561,24 @@ async def _turn(request: Request, c: Candidate | None):
         return xml(await gather(c, "Sorry, I didn't catch that. Could you say that again?"))
 
     c.silent = 0
+    c.holding = False             # any speech ends a hold
     c.history.append({"role": "user", "content": heard})
+
+    # "Hold on, let me check": say so, then wait quietly instead of talking over them.
+    if wants_wait(heard):
+        c.holding, c.waits = True, 0
+        c.history.append({"role": "assistant", "content": WAIT_OK})
+        return xml(await gather(c, WAIT_OK, wait=HOLD_SECONDS))
+
+    # Asked to repeat (or cut off mid-opener): replay our last line verbatim. No LLM call, and
+    # its audio is already cached, so the answer is instant and free.
+    if wants_repeat(heard) and c.repeats < MAX_REPEATS:
+        c.repeats += 1
+        last = next((m["content"] for m in reversed(c.history) if m["role"] == "assistant"),
+                    opener(RUN, c))
+        c.history.append({"role": "assistant", "content": last})
+        return xml(await gather(c, last))
+
     try:
         out = await llm([{"role": "system", "content": system_prompt(RUN, c)}] + c.history[-6:])
     except Exception as e:  # never leave the line dead

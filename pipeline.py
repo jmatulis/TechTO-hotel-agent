@@ -368,7 +368,7 @@ async def run_pipeline(run: agent.Run) -> agent.Candidate | None:
             print(f"round {rnd}: calling " + ", ".join(f"{c.name} ({c.price:.0f})" for c in batch),
                   file=sys.stderr)
             with obs.span("prepare audio", lines=len(batch) + 1):
-                await asyncio.gather(agent.tts(agent.BYE),                      # pre-build openers + goodbye
+                await asyncio.gather(agent.tts(agent.BYE), agent.tts(agent.WAIT_OK),                      # pre-build openers + goodbye
                                      *(agent.tts(agent.opener(run, c)) for c in batch))
             winner = await race(run, batch)
             run.mark(f"round{rnd}")
