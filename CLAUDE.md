@@ -31,10 +31,10 @@ details. The agent does not negotiate, and by default it doesn't take payment or
 | File               | What it is                                                                           |
 | ------------------ | ------------------------------------------------------------------------------------ |
 | `agent.py`         | The whole agent: config, search, ranking, Twilio webhooks, call orchestration, email |
-| `test-agent.py`    | Offline tests; every outside service is faked. **Run after every change.**           |
+| `tests/test-agent.py`    | Offline tests; every outside service is faked. **Run after every change.**           |
 | `pipeline.py`      | Prompt → Backboard parse → hotel_search → call cheapest `CALL_BATCH` → Backboard reads transcripts → cheapest confirmed; next batch if none |
 | `hotel_search.py`  | CLI: cheapest rates in a city via SerpApi Google Hotels, phones via details page / Places / Maps |
-| `call_test.py`     | Dials one invented hotel: real call, no SerpApi, no email. Tune the call here         |
+| `tests/call_test.py`     | Dials one invented hotel: real call, no SerpApi, no email. Tune the call here         |
 | `README.md`        | Human-facing blueprint, API payloads, setup, checklist                               |
 | `.env.example`     | All config keys; copy to `.env` (never commit `.env`)                                |
 | `requirements.txt` | httpx[http2], fastapi, uvicorn, python-dotenv, python-multipart                      |
@@ -116,9 +116,9 @@ redial), `unreachable`, `timeout`, `cancelled` (a better option won), `no_phone`
 
 ```bash
 pip install -r requirements.txt
-.venv/bin/python test-agent.py                         # offline tests, no keys needed
+.venv/bin/python tests/test-agent.py                         # offline tests, no keys needed
 cloudflared tunnel --url http://localhost:8080         # or: ngrok http 8080 → PUBLIC_URL
-.venv/bin/python call_test.py "Good Value Inn" 129      # ONE real call, no search, no email
+.venv/bin/python tests/call_test.py "Good Value Inn" 129      # ONE real call, no search, no email
 .venv/bin/python pipeline.py "King room in Toronto Oct 18-19 for 2, send to judge@x.com"   # full flow
 .venv/bin/python pipeline.py --list "I'm looking for Toronto, for 3 people, Oct 18 to Oct 20"   # parse + search + phones, no calls
 .venv/bin/python hotel_search.py Toronto 2026-10-18 --top 10 --phones    # rates + phones
@@ -136,7 +136,7 @@ Test the multi-call flow on your own phone: set `PHONE_OVERRIDE=<cell>`, answer 
 - **Never block the event loop**: blocking work goes through `asyncio.to_thread` (like SMTP).
 - A `/turn` handler must always return valid TwiML, even when the LLM fails, so the line never goes dead.
 - The agent says it's an automated assistant, never shares payment details, and never invents facts.
-- Run `.venv/bin/python test-agent.py` after every change (plain `python` is not on PATH, and
+- Run `.venv/bin/python tests/test-agent.py` after every change (plain `python` is not on PATH, and
   system `python3` has no fastapi); add a test for each new behaviour, with
   services faked as the existing tests do.
 - Don't print or log API keys or the full `.env`.

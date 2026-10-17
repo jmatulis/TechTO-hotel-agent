@@ -27,6 +27,8 @@ from datetime import date, timedelta
 
 import httpx
 
+from schemas import Hotel, HotelQuery
+
 try:
     from dotenv import load_dotenv
     load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
@@ -84,7 +86,7 @@ def serp_cheapest(props: list, nights: int) -> list[dict]:
             rate.get("extracted_before_taxes_fees") or 0) * nights or None
         rows.append({"hotel_id": p.get("property_token"), "name": p.get("name") or "?",
                      "address": None, "rating": p.get("overall_rating"),
-                     "stars": p.get("extracted_hotel_class"), "total": float(total), "pre_tax": pre_tax,
+                     "stars": p.get("extracted_hotel_class"), "reviews": p.get("reviews"), "total": float(total), "pre_tax": pre_tax,
                      "per_night": float(night), "phone": None,
                      "lat": (p.get("gps_coordinates") or {}).get("latitude"),
                      "lng": (p.get("gps_coordinates") or {}).get("longitude")})
@@ -222,6 +224,35 @@ async def search(city: str, checkin: str, nights: int = 1, adults: int = 2, top:
     if phones:
         await asyncio.gather(*(serp_phone(r, base) for r in rows if r["hotel_id"]))
     return rows
+
+
+def to_hotel(row: dict) -> Hotel:
+    """One `search()` row -> Hotel. SerpApi's rating is Google's 0-5 scale, so it fills review_rating."""
+    return Hotel(source="serpapi", id=str(row["hotel_id"] or row["name"]), name=row["name"],
+                 address=row.get("address"), lat=row.get("lat"), lng=row.get("lng"),
+                 distance_km=row.get("km"), price=row["total"], currency=CURRENCY,
+                 stars=row.get("stars"), phone=row.get("phone"),
+                 review_rating=row.get("rating"), review_count=row.get("reviews"))
+
+
+async def find_hotels(query: HotelQuery | None = None, **fields) -> list[Hotel]:
+    """Same contract as liteapi_search.find_hotels: the `limit` cheapest hotels within `radius_m`
+    of the city centre, cheapest first, with phones. Costs 1 hotels search + 1 geocode
+    + 1 details search per hotel returned. Needs SERPAPI_KEY."""
+    global HTTP
+    q = query or HotelQuery(**fields)
+    nights = max(1, (q.check_out - q.check_in).days)
+    own = HTTP is None
+    if own:
+        HTTP = httpx.AsyncClient(http2=True, timeout=15)
+    try:
+        rows = await search(q.city, q.check_in.isoformat(), nights, q.adults * q.rooms, q.limit,
+                            phones=True, near=q.city, radius_km=q.radius_m / 1000)
+    finally:
+        if own:
+            await HTTP.aclose()
+            HTTP = None
+    return [to_hotel(r) for r in rows]
 
 
 def table(rows: list[dict]) -> str:

@@ -158,7 +158,7 @@ pre-generated openers; `off` disables it entirely.
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env              # fill in keys
 cloudflared tunnel --url http://localhost:8080   # or: ngrok http 8080 → put URL in PUBLIC_URL
-.venv/bin/python test-agent.py    # offline tests, no keys needed
+.venv/bin/python tests/test-agent.py    # offline tests, no keys needed
 ```
 
 ## Commands
@@ -169,7 +169,7 @@ Any `.env` value can be overridden for one run by prefixing it, e.g.
 
 **Tests (free, no keys, no network)**
 ```bash
-.venv/bin/python test-agent.py
+.venv/bin/python tests/test-agent.py
 ```
 
 **Hotel search: prices + phones, no calls** (`hotel_search.py`, SerpApi)
@@ -196,10 +196,10 @@ PHONE_OVERRIDE=+1XXXXXXXXXX .venv/bin/python pipeline.py "..."   # every call ri
 ```
 Tuning: `CALL_BATCH` (3 per round), `MAX_ROUNDS` (3), `RADIUS_KM` (20, 0 = off), `SEARCH_PAGES` (1).
 
-**One test call, no search, no email** (`call_test.py`; needs `PHONE_OVERRIDE`)
+**One test call, no search, no email** (`tests/call_test.py`; needs `PHONE_OVERRIDE`)
 ```bash
-.venv/bin/python call_test.py                         # "Test Inn" at 129
-.venv/bin/python call_test.py "Good Value Inn" 149    # your own hotel name and nightly rate
+.venv/bin/python tests/call_test.py                         # "Test Inn" at 129
+.venv/bin/python tests/call_test.py "Good Value Inn" 149    # your own hotel name and nightly rate
 ```
 
 **Original single-file agent** (`agent.py`: SerpApi search, parallel calls, first verified wins, email)
@@ -222,7 +222,7 @@ with "sorry, we're fully booked", then confirm the second one.
 - [ ] SerpApi credits: each run uses about 1 + K lookups (a few more if hotels lack phone numbers)
 - [ ] Tunnel up, and `PUBLIC_URL` matches it
 - [ ] Test receipt lands in the inbox, not spam
-- [ ] `call_test.py` against your own cell, then one real end-to-end `agent.py` run with `PHONE_OVERRIDE` - listen for the ElevenLabs voice on the
+- [ ] `tests/call_test.py` against your own cell, then one real end-to-end `agent.py` run with `PHONE_OVERRIDE` - listen for the ElevenLabs voice on the
       opener; if you hear Polly instead, `<Play>` failed and it fell back
 - [ ] Ask the organizers: do agents call the real hotels, or a judge-run line? If it's one line,
       set `PHONE_OVERRIDE` to it (calls then go out one at a time so they don't collide)
