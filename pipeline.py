@@ -135,7 +135,7 @@ def candidate(i: int, h: Hotel, nights: int) -> agent.Candidate:
 async def race(run: agent.Run, batch: list[agent.Candidate]) -> agent.Candidate | None:
     """Phone the whole batch at once and decide as the calls finish, not when the last one does.
 
-    Each call is its own task: it dials (dropped after CALL_TIMEOUT), reads its own transcript, then
+    Each call is its own task: it dials (cut off after CALL_TIMEOUT, partial transcript kept), reads its own transcript, then
     posts itself on a queue. We take events one at a time, update the price table and ask
     `decider.Board.decide()` whether another call is still worth waiting for. When it says stop, the
     calls still ringing are hung up. Returns the winning candidate, or None if nobody confirmed."""
@@ -154,8 +154,10 @@ async def race(run: agent.Run, batch: list[agent.Candidate]) -> agent.Candidate 
                 try:
                     await asyncio.wait_for(agent.call_candidate(run, c), agent.CALL_TIMEOUT)
                 except asyncio.TimeoutError:
-                    c.status = "timeout"                 # too late: whatever was said is ignored
-            if c.status != "timeout":
+                    c.status = "timeout"                 # cancelled above: the line is hung up
+            if c.status == "timeout":
+                keep_partial(run, c)
+            else:
                 talked = c.history and c.status != "unavailable"      # a clear "no" needs no second reading
                 facts = await read_calls(run, [c]) if talked else {}
                 apply(run, c, facts.get(c.idx))
@@ -259,6 +261,15 @@ def quoted_total(run: agent.Run, c: agent.Candidate) -> float | None:
     if isinstance(f.get("price"), (int, float)):
         return float(f["price"]) * agent.nights(run.req)
     return None
+
+
+def keep_partial(run: agent.Run, c: agent.Candidate):
+    """A call cut off at CALL_TIMEOUT: keep what was said so far, but it never counts as a
+    confirmation (available stays None, no price). No LLM call is spent on it."""
+    if c.history:
+        c.call = CallQuery(transcript=transcript(run, c), call_url=call_url(c.sid), available=None,
+                           summary=f"Call cut off after {agent.CALL_TIMEOUT:g} s; partial transcript only.")
+        c.hotel.call_query = c.call
 
 
 def call_url(sid: str | None) -> str | None:
