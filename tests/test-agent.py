@@ -672,6 +672,71 @@ async def t_race():
     print("ok  race: early stop, waits for a much cheaper hotel only while it pays, cut-off ignores late calls")
 
 
+async def t_observability():
+    """The waterfall: run > race > call (one per hotel, with latency + transcript), the decision events,
+    and run > email > build/send with the timing block in the mail. Exported to memory, not to Logfire."""
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    import mailer
+    import obs
+    import pipeline as pl
+    from schemas import Hotel
+
+    exporter = InMemorySpanExporter()
+    assert obs.setup(processors=[SimpleSpanProcessor(exporter)])
+    agent.RUN = run = agent.Run("x")
+    run.req = {"city": "T", "check_in": "2026-10-18", "check_out": "2026-10-19", "adults": 2, "email": "j@x.ca"}
+    run.cands = [pl.candidate(i, Hotel(id=n, name=n, price=p, currency="CAD", phone=f"+1416555010{i}"), 1)
+                 for i, (n, p) in enumerate([("Yes Inn", 100), ("No Inn", 110)])]
+    sent = {}
+
+    async def fake_call(run_, c):
+        c.attempts += 1
+        await asyncio.sleep(0.02)
+        ok = c.name == "Yes Inn"
+        c.history = [{"role": "user", "content": "Yes" if ok else "Full"}]
+        c.facts.update(available=ok, price=100 if ok else None)
+        c.status = "verified" if ok else "unavailable"
+
+    async def fake_llm(m):
+        return {"calls": [{"id": 0, "available": True, "nightly_price": 100, "summary": "Yes Inn said yes"}]}
+
+    async def fake_send(to, subject, text, html, client=None, attachments=None):
+        sent.update(to=to, text=text, html=html)
+
+    saved = (agent.call_candidate, agent.llm, mailer.send, mailer.configured, agent.RECORD_CALLS)
+    agent.call_candidate, agent.llm, mailer.send, mailer.configured, agent.RECORD_CALLS = (
+        fake_call, fake_llm, fake_send, lambda: None, False)
+    try:
+        with obs.span("hotel-agent run") as rsp:
+            run.span = rsp
+            run.mark("parse")
+            run.mark("search")
+            run.winner = await pl.race(run, run.cands)
+            run.mark("round1")
+            await pl.send_email(run)
+    finally:
+        agent.call_candidate, agent.llm, mailer.send, mailer.configured, agent.RECORD_CALLS = saved
+        obs.ENABLED = False
+
+    spans = exporter.get_finished_spans()
+    by_id = {s.context.span_id: s for s in spans}
+    parent = lambda s: by_id[s.parent.span_id].name if s.parent and s.parent.span_id in by_id else None
+    names = [s.name for s in spans]
+    calls = [s for s in spans if s.name == "call"]
+    assert len(calls) == 2 and all(parent(s) == "race" for s in calls), [(s.name, parent(s)) for s in spans]
+    assert parent(next(s for s in spans if s.name == "race")) == "hotel-agent run"
+    yes = next(s for s in calls if s.attributes["hotel"] == "Yes Inn")
+    assert yes.attributes["available"] is True and yes.attributes["quoted_stay"] == 100.0, dict(yes.attributes)
+    assert "Yes" in yes.attributes["transcript"] and yes.attributes["latency_s"] >= 0.0
+    assert yes.attributes["transcript"].startswith("Agent: ") and yes.attributes["status"] == "verified"
+    assert all(parent(next(s for s in spans if s.name == n)) == "email" for n in ("build email", "send email"))
+    assert any(s.name == "decision" for s in spans), names
+    assert sent["to"] == "j@x.ca" and "RUN TIMING" in sent["text"] and "Total until sent" in sent["text"], sent["text"]
+    assert "Run timing" in sent["html"] and "Phone calls, until the decision" in sent["html"]
+    print("ok  observability: run > race > call spans with latency + transcript, email spans, timing in the mail")
+
+
 async def t_prompt_email():
     """The address typed in the prompt wins over the LLM's copy and JUDGE_EMAIL; no address -> JUDGE_EMAIL."""
     import pipeline as pl
@@ -914,6 +979,7 @@ async def main():
     await t_short_call()
     await t_recording()
     await t_race()
+    await t_observability()
     await t_prompt_email()
     await t_mailer()
     await t_hotel_search()

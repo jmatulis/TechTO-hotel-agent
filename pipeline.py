@@ -27,6 +27,7 @@ import agent
 import decider
 import hotel_search as hs
 import liteapi_search as lite
+import obs
 import ranker
 from schemas import CallQuery, Hotel, HotelQuery
 import mailer
@@ -95,17 +96,29 @@ async def search(req: dict) -> list[Hotel]:
                    adults=req["adults"], currency=agent.CURRENCY,
                    radius_m=int(RADIUS_KM * 1000) if RADIUS_KM else 100_000,
                    limit=BATCH * MAX_ROUNDS * 2)            # spare hotels for ones with no phone
-    sources = {"serpapi": hs.find_hotels(q, phones=False, pages=SEARCH_PAGES), "liteapi": lite.find_hotels(q)}
+    async def timed(name: str, coro):
+        with obs.span(f"search {name}") as sp:
+            found = await coro
+            sp.set_attribute("hotels", len(found))
+            return found
+
+    sources = {"serpapi": timed("serpapi", hs.find_hotels(q, phones=False, pages=SEARCH_PAGES)),
+               "liteapi": timed("liteapi", lite.find_hotels(q))}
     results = await asyncio.gather(*sources.values(), return_exceptions=True)
     lists = []
     for name, r in zip(sources, results):
         if isinstance(r, BaseException):
             print(f"[search] {name} failed: {r!r}", file=sys.stderr)
+            obs.event("search source failed", source=name, error=repr(r))
         else:
             lists.append(r)
     if not lists:
         raise next(r for r in results if isinstance(r, BaseException))
-    return ranker.rank(ranker.merge(*lists))
+    with obs.span("merge and rank", found=sum(len(x) for x in lists)) as sp:
+        ranked = ranker.rank(ranker.merge(*lists))
+        sp.set_attributes({"unique": len(ranked), "cheapest_stay": ranked[0].price if ranked else None,
+                           "order": ", ".join(f"{h.name} ({h.price:.0f})" for h in ranked[:BATCH])})
+    return ranked
 
 
 async def phone(h: Hotel, req: dict):
@@ -133,6 +146,15 @@ def candidate(i: int, h: Hotel, nights: int) -> agent.Candidate:
 
 # ---------------------------------------------------------------- 3. calls
 async def race(run: agent.Run, batch: list[agent.Candidate]) -> agent.Candidate | None:
+    """`_race` under its span (the waterfall's "race" row; every call is a child of it)."""
+    with obs.span("race", hotels=len(batch), call_timeout_s=agent.CALL_TIMEOUT, latency_cost=POLICY.latency_cost,
+                  segment_pct=POLICY.segment_pct) as sp:
+        winner = await _race(run, batch, sp)
+        sp.set_attribute("winner", winner.name if winner else None)
+        return winner
+
+
+async def _race(run: agent.Run, batch: list[agent.Candidate], sp) -> agent.Candidate | None:
     """Phone the whole batch at once and decide as the calls finish, not when the last one does.
 
     Each call is its own task: it dials (cut off after CALL_TIMEOUT, partial transcript kept), reads its own transcript, then
@@ -148,24 +170,40 @@ async def race(run: agent.Run, batch: list[agent.Candidate]) -> agent.Candidate 
     clock = lambda: time.perf_counter() - t0
 
     async def one(c: agent.Candidate):
-        try:
-            async with gate:
-                board.start(key(c), clock())
-                try:
-                    await asyncio.wait_for(agent.call_candidate(run, c), agent.CALL_TIMEOUT)
-                except asyncio.TimeoutError:
-                    c.status = "timeout"                 # cancelled above: the line is hung up
-            if c.status == "timeout":
-                keep_partial(run, c)
-            else:
-                talked = c.history and c.status != "unavailable"      # a clear "no" needs no second reading
-                facts = await read_calls(run, [c]) if talked else {}
-                apply(run, c, facts.get(c.idx))
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            print(f"[call] {c.name}: {e!r}", file=sys.stderr)
-            c.status = "error"
+        with obs.span("call", hotel=c.name, rank=c.idx, listed_stay=c.total, listed_night=c.price,
+                      distance_km=c.km) as csp:
+            c.obs_ctx = obs.capture()                   # the /turn webhooks report under this span
+            dialed = time.perf_counter()
+            try:
+                async with gate:
+                    board.start(key(c), clock())
+                    dialed = time.perf_counter()
+                    try:
+                        await asyncio.wait_for(agent.call_candidate(run, c), agent.CALL_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        c.status = "timeout"            # cancelled above: the line is hung up
+                if c.status == "timeout":
+                    keep_partial(run, c)
+                else:
+                    talked = c.history and c.status != "unavailable"  # a clear "no" needs no second reading
+                    facts = await read_calls(run, [c]) if talked else {}
+                    apply(run, c, facts.get(c.idx))
+            except asyncio.CancelledError:
+                c.status = c.status if c.status in agent.TERMINAL else "cancelled"
+                raise
+            except Exception as e:
+                print(f"[call] {c.name}: {e!r}", file=sys.stderr)
+                csp.record_exception(e)
+                c.status = "error"
+            finally:      # latency + transcript for every call, answered, cut off or cancelled
+                cq = c.call
+                csp.set_attributes({
+                    "status": c.status, "latency_s": round(time.perf_counter() - dialed, 1),
+                    "call_seconds": c.billed_seconds, "turns": c.turns, "call_sid": c.sid,
+                    "available": cq.available if cq else None, "quoted_stay": cq.price if cq else None,
+                    "summary": cq.summary if cq else None, "call_url": cq.call_url if cq else None,
+                    "transcript": cq.transcript if cq else (transcript(run, c) if c.history else ""),
+                    "timed_out": c.status == "timeout"})
         await events.put(c)
 
     tasks = [asyncio.create_task(one(c)) for c in batch]
@@ -183,6 +221,8 @@ async def race(run: agent.Run, batch: list[agent.Candidate]) -> agent.Candidate 
             except asyncio.TimeoutError:
                 pass
             decision = board.decide(clock())
+            obs.event("decision", at_s=round(clock(), 1), stop=decision.stop, reason=decision.reason,
+                      pending=sum(1 for e in board.entries if not e.answered))
             if decision.stop:
                 break
     finally:
@@ -190,6 +230,9 @@ async def race(run: agent.Run, batch: list[agent.Candidate]) -> agent.Candidate 
             t.cancel()                                    # hangs up whoever is still ringing
         await asyncio.gather(*tasks, return_exceptions=True)
     print(board.render(clock()) + f"\n=> {decision.reason}", file=sys.stderr)
+    sp.set_attributes({"decided_at_s": round(clock(), 1), "reason": decision.reason,
+                       "board": board.render(clock()),
+                       "cut_short": sum(1 for e in board.entries if not e.answered)})
     return by_key.get(decision.winner)
 
 
@@ -284,37 +327,48 @@ def stay_cost(run: agent.Run, c: agent.Candidate) -> float:
 
 # ---------------------------------------------------------------- orchestration
 async def run_pipeline(run: agent.Run) -> agent.Candidate | None:
-    run.req = await parse(run.prompt)
+    with obs.span("parse request") as sp:
+        run.req = await parse(run.prompt)
+        sp.set_attributes({k: v for k, v in run.req.items() if k != "email"})
     run.mark("parse")
     if not run.req.get("city"):
         raise SystemExit("Could not find a city in the prompt.")
     print("request:", json.dumps(run.req), file=sys.stderr)
+    if run.span:
+        run.span.set_attributes({k: v for k, v in run.req.items() if k != "email"})
 
-    hotels = await search(run.req)
+    with obs.span("search") as sp:
+        hotels = await search(run.req)
+        sp.set_attribute("hotels", len(hotels))
     run.cands = [candidate(i, h, agent.nights(run.req)) for i, h in enumerate(hotels)]
     run.mark("search")
     print(f"search:  {len(hotels)} priced options", file=sys.stderr)
 
     pool = list(run.cands)
     for rnd in range(1, MAX_ROUNDS + 1):
-        batch = []
-        while len(batch) < BATCH and pool:          # backfill past hotels with no phone
-            take, pool = pool[:BATCH - len(batch)], pool[BATCH - len(batch):]
-            await asyncio.gather(*(phone(c.hotel, run.req) for c in take))
-            for c in take:
-                c.phone, c.address = c.hotel.phone, c.hotel.address or c.address
-                if c.phone or agent.PHONE_OVERRIDE:
-                    batch.append(c)
-                else:
-                    c.status = "no_phone"
-        if not batch:
-            break
-        print(f"round {rnd}: calling " + ", ".join(f"{c.name} ({c.price:.0f})" for c in batch),
-              file=sys.stderr)
-        await asyncio.gather(agent.tts(agent.BYE),                          # pre-build openers + goodbye
-                             *(agent.tts(agent.opener(run, c)) for c in batch))
-        winner = await race(run, batch)
-        run.mark(f"round{rnd}")
+        with obs.span("round", n=rnd) as rsp:
+            batch = []
+            with obs.span("phone lookups") as sp:
+                while len(batch) < BATCH and pool:          # backfill past hotels with no phone
+                    take, pool = pool[:BATCH - len(batch)], pool[BATCH - len(batch):]
+                    await asyncio.gather(*(phone(c.hotel, run.req) for c in take))
+                    for c in take:
+                        c.phone, c.address = c.hotel.phone, c.hotel.address or c.address
+                        if c.phone or agent.PHONE_OVERRIDE:
+                            batch.append(c)
+                        else:
+                            c.status = "no_phone"
+                sp.set_attributes({"calling": len(batch), "no_phone": sum(c.status == "no_phone" for c in run.cands)})
+            if not batch:
+                break
+            print(f"round {rnd}: calling " + ", ".join(f"{c.name} ({c.price:.0f})" for c in batch),
+                  file=sys.stderr)
+            with obs.span("prepare audio", lines=len(batch) + 1):
+                await asyncio.gather(agent.tts(agent.BYE),                      # pre-build openers + goodbye
+                                     *(agent.tts(agent.opener(run, c)) for c in batch))
+            winner = await race(run, batch)
+            run.mark(f"round{rnd}")
+            rsp.set_attribute("winner", winner.name if winner else None)
         if winner:
             run.winner = winner
             return winner
@@ -329,7 +383,7 @@ def report(run: agent.Run) -> dict:
         "winner": ({**run.winner.summary(), "stay_cost": stay_cost(run, run.winner)}
                    if run.winner else None),
         "called": [{"name": c.name, "listed_night": c.price, "status": c.status, "phone": c.phone,
-                    "distance_km": c.km, "summary": c.call.summary if c.call else None,
+                    "distance_km": c.km, "latency_s": c.local_seconds, "summary": c.call.summary if c.call else None,
                     "quoted_night": c.facts.get("price"),
                     "quoted_total": c.facts.get("total") or (c.facts.get("price") or 0) * n or None,
                     "room_type": c.facts.get("room_type"), "fees": c.facts.get("fees"),
@@ -383,11 +437,19 @@ def email_items(run: agent.Run) -> tuple[dict, dict | None, list[dict], dict]:
     called = [c for c in run.cands if c.attempts or c.status == "no_phone"]
     items = {c.idx: item(c) for c in called}
     winner = items.get(run.winner.idx) if run.winner else None
-    stats = {"Total run time (s)": round(time.perf_counter() - run.t0, 1),
-             "Hotels phoned": sum(1 for c in called if c.attempts),
-             "Call minutes": round(sum(c.billed_seconds for c in run.cands) / 60, 2),
-             "LLM calls / tokens in / out": f"{run.llm_calls} / {run.tok_in} / {run.tok_out}",
-             "SerpApi requests": hs.COUNT["serpapi"]}
+    m = run.marks
+    rounds = [v for k, v in m.items() if k.startswith("round")]
+    stats = {}
+    if "parse" in m:
+        stats["Request understood"] = f"{m['parse']:.1f} s"
+    if "search" in m:
+        stats["Hotel search"] = f"{m['search'] - m.get('parse', 0):.1f} s"
+    if rounds and "search" in m:
+        stats["Phone calls, until the decision"] = f"{max(rounds) - m['search']:.1f} s"
+    if run.winner:
+        stats["Winning call length"] = f"{run.winner.billed_seconds} s"
+    stats["Hotels phoned"] = sum(1 for c in called if c.attempts)
+    stats["Total until sent"] = f"{time.perf_counter() - run.t0:.1f} s"
     return {**run.req, "nights": n}, winner, list(items.values()), stats
 
 
@@ -403,8 +465,36 @@ async def winner_recording(run: agent.Run) -> list[tuple[str, bytes, str]]:
     return [(f"call-{safe}-{run.req['check_in']}.mp3", mp3, "audio/mpeg")]
 
 
+async def send_email(run: agent.Run):
+    """The email step, under its own span. Never raises: the calls already cost money."""
+    with obs.span("email") as sp:
+        to = run.req.get("email")
+        if not to:
+            print("[email] skipped: no address in the prompt and JUDGE_EMAIL is empty", file=sys.stderr)
+            sp.set_attribute("skipped", "no address")
+        elif problem := mailer.configured():
+            print(f"[email] skipped: {problem}", file=sys.stderr)
+            sp.set_attribute("skipped", problem)
+        else:
+            try:
+                with obs.span("fetch recording"):
+                    attachments = await winner_recording(run)
+                with obs.span("build email") as bsp:
+                    subject, text, html = mailer.build(*email_items(run))
+                    bsp.set_attributes({"subject": subject, "chars": len(text), "has_winner": run.winner is not None})
+                with obs.span("send email", provider="resend" if mailer.RESEND_KEY else "smtp",
+                              attachments=len(attachments), bytes=sum(len(a[1]) for a in attachments)):
+                    await mailer.send(to, subject, text, html, client=agent.HTTP, attachments=attachments)
+                run.mark("email")
+                print(f"[email] sent to {to}", file=sys.stderr)
+            except Exception as e:
+                print(f"[email] FAILED: {e!r}", file=sys.stderr)
+                sp.record_exception(e)
+
+
 async def list_only(prompt: str, top: int = 10):
     """Parse + search + phones, print the table, phone nobody."""
+    obs.setup()
     preflight(calling=False)
     agent.HTTP = hs.HTTP = httpx.AsyncClient(http2=True, timeout=15)
     agent.RUN = run = agent.Run(prompt)
@@ -433,6 +523,7 @@ async def tunnel_ok() -> str | None:
 
 
 async def main(prompt: str):
+    obs.setup()
     preflight()
     agent.HTTP = hs.HTTP = httpx.AsyncClient(http2=True, timeout=15)
     agent.RUN = run = agent.Run(prompt)
@@ -444,25 +535,27 @@ async def main(prompt: str):
         if problem := await tunnel_ok():
             raise SystemExit(f"tunnel check failed: {problem}. Start cloudflared "
                              f"(--url http://localhost:{agent.PORT}) and put its URL in PUBLIC_URL.")
-        await run_pipeline(run)
-        if not run.req.get("email"):
-            print("[email] skipped: no address in the prompt and JUDGE_EMAIL is empty", file=sys.stderr)
-        elif problem := mailer.configured():
-            print(f"[email] skipped: {problem}", file=sys.stderr)
-        else:
+        with obs.span("hotel-agent run", prompt_chars=len(prompt), call_timeout_s=agent.CALL_TIMEOUT,
+                      parallel_calls=BATCH) as rsp:
+            run.span = rsp
             try:
-                await mailer.send(run.req["email"], *mailer.build(*email_items(run)), client=agent.HTTP,
-                                  attachments=await winner_recording(run))
-                run.mark("email")
-                print(f"[email] sent to {run.req['email']}", file=sys.stderr)
-            except Exception as e:      # keep the report: the calls already cost money
-                print(f"[email] FAILED: {e!r}", file=sys.stderr)
+                await run_pipeline(run)
+                await send_email(run)
+            finally:
+                rep = report(run)
+                rsp.set_attributes({
+                    "winner": (rep["winner"] or {}).get("name"), "stay_cost": (rep["winner"] or {}).get("stay_cost"),
+                    "total_s": round(time.perf_counter() - run.t0, 1), "timings_s": json.dumps(run.marks),
+                    "llm_calls": run.llm_calls, "tokens_in": run.tok_in, "tokens_out": run.tok_out,
+                    "call_seconds": rep["call_seconds"], "hotels_phoned": sum(1 for c in run.cands if c.attempts),
+                    "calls_timed_out": sum(c.status == "timeout" for c in run.cands)})
     finally:
         print(json.dumps(report(run), indent=2, default=str))
         await asyncio.sleep(1.0)                    # let Twilio's last /status callbacks land
         server.should_exit = True
         await srv
         await agent.HTTP.aclose()
+        obs.flush()
 
 
 if __name__ == "__main__":
