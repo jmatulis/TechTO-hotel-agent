@@ -33,6 +33,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
+import net
 import obs
 
 try:
@@ -83,10 +84,14 @@ EL_TIMEOUT = float(E("ELEVEN_TIMEOUT", "4"))              # past this we fall ba
 SPEECH_TIMEOUT = E("SPEECH_TIMEOUT", "auto")          # "auto" or seconds, e.g. "1"
 BARGE_IN = E("BARGE_IN", "0") == "1"                  # 1 = the hotel can cut the agent off mid-sentence
 MAX_TURNS = int(E("MAX_TURNS", "6"))
+LLM_CONCURRENCY = int(E("LLM_CONCURRENCY", "8"))              # simultaneous Backboard requests
+ELEVEN_CONCURRENCY = int(E("ELEVEN_CONCURRENCY", "4"))        # ElevenLabs plans allow 2-15 at once
+EL_SLOT_WAIT = float(E("ELEVEN_SLOT_WAIT", "1.0"))            # no free slot after this long: use Twilio's voice
+TWILIO_CONCURRENCY = int(E("TWILIO_CONCURRENCY", "5"))        # simultaneous call-create requests
 CALL_TIMEOUT = float(E("CALL_TIMEOUT", "45"))         # a call still going after this is dropped
 CALL_MAX_SECONDS = int(E("CALL_MAX_SECONDS", "60"))   # Twilio hangs up after this long connected
 BYE = "Perfect, thanks. Goodbye."                     # fixed: its TTS is built once, reused every call
-DIAL_RETRIES = int(E("DIAL_RETRIES", "1"))            # redials on busy / no answer
+DIAL_RETRIES = int(E("DIAL_RETRIES", "0"))            # redials on busy / no answer; 0 = each hotel is dialed once
 RECORD_CALLS = E("RECORD_CALLS", "1") == "1"          # Twilio records each call; the winner's mp3 is emailed
 HOLD_ON_CALL = E("HOLD_ON_CALL", "0") == "1"          # 1 -> accept a hold/reservation if offered
 
@@ -100,7 +105,7 @@ SMTP_PASS = E("SMTP_PASS", "")                        # Gmail app password
 
 RETRYABLE = {"busy", "no-answer"}
 TERMINAL = {"verified", "unavailable", "unclear", "no_answer", "unreachable",
-            "timeout", "no_phone", "cancelled", "error"}
+            "timeout", "no_phone", "duplicate", "cancelled", "error"}
 FACT_KEYS = ("available", "price", "fees", "room_type", "cancellation", "check_in_time",
              "reference", "staff_name")
 
@@ -192,7 +197,9 @@ async def llm(messages: list) -> dict:
         if BB_MODEL:
             body["model_name"] = BB_MODEL
 
-        r = await HTTP.post(f"{BB_BASE}/threads/messages", headers={"X-API-Key": BB_KEY}, json=body)
+        async with net.gate("llm", LLM_CONCURRENCY):
+            r = await net.retry_429(lambda: HTTP.post(f"{BB_BASE}/threads/messages",
+                                                      headers={"X-API-Key": BB_KEY}, json=body), label="backboard")
         r.raise_for_status()
         j = r.json()
         RUN.tok_in += j.get("input_tokens") or 0
@@ -358,21 +365,28 @@ async def tts(text: str) -> str | None:
         return key
     with obs.span("tts", chars=len(text), model=EL_MODEL) as sp:
         t0 = time.perf_counter()
+        slot = net.gate("eleven", ELEVEN_CONCURRENCY)
         try:
-            r = await HTTP.post(
+            await asyncio.wait_for(slot.acquire(), EL_SLOT_WAIT)
+        except asyncio.TimeoutError:
+            sp.set_attribute("skipped", "all ElevenLabs slots busy")
+            return None
+        try:
+            r = await net.retry_429(lambda: HTTP.post(
                 f"https://api.elevenlabs.io/v1/text-to-speech/{EL_VOICE}",
                 headers={"xi-api-key": EL_KEY},
                 params={"output_format": EL_FORMAT},
                 json={"text": text, "model_id": EL_MODEL,
                       "voice_settings": {"speed": EL_SPEED, "stability": EL_STABILITY,
                                          "similarity_boost": EL_SIMILARITY}},
-                timeout=EL_TIMEOUT,
-            )
+                timeout=EL_TIMEOUT), tries=2, base=0.3, label="elevenlabs")
             r.raise_for_status()
         except Exception as e:                         # never stall a live call for TTS
             print(f"[tts] {e!r}", file=sys.stderr)
             sp.set_attributes({"failed": True, "latency_s": round(time.perf_counter() - t0, 2)})
             return None
+        finally:
+            slot.release()
         sp.set_attributes({"latency_s": round(time.perf_counter() - t0, 2), "bytes": len(r.content)})
     AUDIO[key] = r.content
     RUN.tts_calls += 1
@@ -541,15 +555,16 @@ TW_CALLS = "https://api.twilio.com/2010-04-01/Accounts/{sid}/Calls"
 async def place_call(run: Run, c: Candidate) -> str:
     c.attempts += 1
     with obs.span("twilio create call", hotel=c.name, attempt=c.attempts) as sp:
-        r = await HTTP.post(
-            TW_CALLS.format(sid=TW_SID) + ".json", auth=(TW_SID, TW_TOKEN),
-            data={"To": PHONE_OVERRIDE or c.phone, "From": TW_FROM,
-                  "Twiml": await gather(c, opener(run, c)),   # inline: no webhook hop before speaking
-                  "StatusCallback": f"{PUBLIC_URL}/status?c={c.idx}",
-                  "StatusCallbackEvent": "completed", "Timeout": "20",
-                  "TimeLimit": str(CALL_MAX_SECONDS),         # hard cap, enforced by Twilio
-                  **({"Record": "true"} if RECORD_CALLS else {})},
-        )
+        data = {"To": PHONE_OVERRIDE or c.phone, "From": TW_FROM,
+                "Twiml": await gather(c, opener(run, c)),   # inline: no webhook hop before speaking
+                "StatusCallback": f"{PUBLIC_URL}/status?c={c.idx}",
+                "StatusCallbackEvent": "completed", "Timeout": "20",
+                "TimeLimit": str(CALL_MAX_SECONDS),         # hard cap, enforced by Twilio
+                **({"Record": "true"} if RECORD_CALLS else {})}
+        async with net.gate("twilio", TWILIO_CONCURRENCY):
+            r = await net.retry_429(lambda: HTTP.post(TW_CALLS.format(sid=TW_SID) + ".json",
+                                                      auth=(TW_SID, TW_TOKEN), data=data),
+                                    tries=4, base=1.0, label="twilio")
         r.raise_for_status()
         sid = r.json()["sid"]
         sp.set_attribute("call_sid", sid)

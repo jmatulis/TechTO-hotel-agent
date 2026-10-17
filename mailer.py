@@ -46,7 +46,7 @@ FOOTER = "Rate and availability confirmed by an automated phone call. No payment
 
 STATUS_TEXT = {"verified": "Confirmed available", "unavailable": "No availability",
                "unclear": "Could not confirm", "no_answer": "No answer / busy",
-               "unreachable": "Call failed", "timeout": "Call timed out", "no_phone": "No phone listed",
+               "unreachable": "Call failed", "timeout": "Call timed out", "no_phone": "No phone listed", "duplicate": "Same number as another hotel",
                "cancelled": "Not needed", "error": "Error", "queued": "Not called"}
 
 

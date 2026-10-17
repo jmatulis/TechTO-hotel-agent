@@ -345,6 +345,7 @@ async def run_pipeline(run: agent.Run) -> agent.Candidate | None:
     print(f"search:  {len(hotels)} priced options", file=sys.stderr)
 
     pool = list(run.cands)
+    dialed: set[str] = set()                    # phone numbers already taken: one call per number, ever
     for rnd in range(1, MAX_ROUNDS + 1):
         with obs.span("round", n=rnd) as rsp:
             batch = []
@@ -354,7 +355,10 @@ async def run_pipeline(run: agent.Run) -> agent.Candidate | None:
                     await asyncio.gather(*(phone(c.hotel, run.req) for c in take))
                     for c in take:
                         c.phone, c.address = c.hotel.phone, c.hotel.address or c.address
-                        if c.phone or agent.PHONE_OVERRIDE:
+                        if c.phone and c.phone in dialed:
+                            c.status = "duplicate"          # the same front desk under another listing
+                        elif c.phone or agent.PHONE_OVERRIDE:
+                            dialed.add(c.phone)
                             batch.append(c)
                         else:
                             c.status = "no_phone"

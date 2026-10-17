@@ -737,6 +737,136 @@ async def t_observability():
     print("ok  observability: run > race > call spans with latency + transcript, email spans, timing in the mail")
 
 
+async def t_rate_limits():
+    """429s: retried with backoff, bounded in flight, never leaking the SerpApi key; TTS gives up on a busy slot."""
+    import httpx
+    import hotel_search as hs
+    import net
+
+    def resp(code, url="https://x.test/", **headers):
+        return httpx.Response(code, headers=headers, request=httpx.Request("GET", url))
+
+    # retry: two 429s (Retry-After: 0) then success
+    seq = [resp(429, **{"retry-after": "0"}), resp(429, **{"retry-after": "0"}), resp(200)]
+    n = []
+
+    async def send():
+        n.append(1)
+        return seq[len(n) - 1]
+    r = await net.retry_429(send, tries=3, label="t")
+    assert r.status_code == 200 and len(n) == 3
+    # a 429 that never clears is handed back after `tries` attempts
+    n.clear()
+
+    async def always():
+        n.append(1)
+        return resp(429, **{"retry-after": "0"})
+    assert (await net.retry_429(always, tries=3)).status_code == 429 and len(n) == 3
+    # other errors are not retried
+    n.clear()
+
+    async def boom():
+        n.append(1)
+        return resp(500)
+    assert (await net.retry_429(boom, tries=3)).status_code == 500 and len(n) == 1
+
+    # gate: never more than 3 in flight
+    net.reset()
+    live = peak = 0
+
+    async def work():
+        nonlocal live, peak
+        async with net.gate("t", 3):
+            live += 1
+            peak = max(peak, live)
+            await asyncio.sleep(0.01)
+            live -= 1
+    await asyncio.gather(*(work() for _ in range(12)))
+    assert peak == 3, peak
+
+    # SerpApi: 429 is retried, and the error text carries no URL (the api_key rides in it)
+    calls = []
+
+    class FakeHTTP:
+        async def get(self, url, params=None, **kw):
+            calls.append(1)
+            return resp(429, url + "?api_key=SECRET123&q=x", **{"retry-after": "0"})
+    saved = (hs.HTTP, hs.SERPAPI_KEY)
+    hs.HTTP, hs.SERPAPI_KEY = FakeHTTP(), "SECRET123"
+    net.reset()
+    try:
+        await hs.serp({"engine": "google_hotels"})
+        raise AssertionError("a 429 that never clears should raise")
+    except RuntimeError as e:
+        assert "429" in str(e) and "SECRET123" not in str(e) and "api_key" not in str(e), str(e)
+    finally:
+        hs.HTTP, hs.SERPAPI_KEY = saved
+    assert len(calls) == 3, calls
+
+    # TTS: every ElevenLabs slot busy -> no request, the line goes out in Twilio's voice
+    net.reset()
+    sent = []
+
+    class FakeEL:
+        async def post(self, *a, **k):
+            sent.append(1)
+            return resp(200)
+    saved = (agent.HTTP, agent.EL_KEY, agent.PUBLIC_URL, agent.EL_MODE, agent.EL_SLOT_WAIT, agent.ELEVEN_CONCURRENCY)
+    agent.HTTP, agent.EL_KEY, agent.PUBLIC_URL, agent.EL_MODE = FakeEL(), "k", "https://p.test", "all"
+    agent.EL_SLOT_WAIT, agent.ELEVEN_CONCURRENCY = 0.05, 1
+    agent.RUN = agent.Run("x")
+    try:
+        slot = net.gate("eleven", 1)
+        await slot.acquire()
+        assert await agent.tts("a line nobody has cached") is None and not sent
+        slot.release()
+    finally:
+        (agent.HTTP, agent.EL_KEY, agent.PUBLIC_URL, agent.EL_MODE, agent.EL_SLOT_WAIT,
+         agent.ELEVEN_CONCURRENCY) = saved
+        net.reset()
+    print("ok  rate limits: 429 retried with backoff, requests capped, no key in errors, busy TTS slot -> Say")
+
+
+async def t_one_call_each():
+    """Each hotel is dialed once: a phone number shared by two listings is taken once, and the
+    default is no redial on busy / no answer."""
+    import pipeline as pl
+    from schemas import Hotel
+
+    hotels = [Hotel(id=i, name=n, price=p, currency="CAD", phone=ph) for i, n, p, ph in
+              [("a", "Alpha", 100, "+14165550001"), ("b", "Alpha Annex", 105, "+14165550001"),
+               ("c", "Charlie", 110, "+14165550003")]]
+    dialed = []
+
+    async def fake_search(req):
+        return hotels
+
+    async def fake_call(run_, c):
+        dialed.append(c.name)
+        c.attempts += 1
+        c.history = [{"role": "user", "content": "Sorry, full"}]
+        c.facts["available"] = False
+        c.status = "unavailable"
+
+    async def fake_llm(m):
+        return {"city": "Toronto", "check_in": "2026-10-18", "check_out": "2026-10-19", "adults": 2}
+
+    async def no_tts(text):
+        return None
+    saved = (pl.search, agent.call_candidate, agent.llm, agent.tts, agent.PHONE_OVERRIDE)
+    pl.search, agent.call_candidate, agent.llm, agent.tts, agent.PHONE_OVERRIDE = (
+        fake_search, fake_call, fake_llm, no_tts, "")
+    agent.RUN = run = agent.Run("Toronto")
+    try:
+        await pl.run_pipeline(run)
+    finally:
+        pl.search, agent.call_candidate, agent.llm, agent.tts, agent.PHONE_OVERRIDE = saved
+    assert dialed == ["Alpha", "Charlie"], dialed
+    assert next(c for c in run.cands if c.name == "Alpha Annex").status == "duplicate"
+    assert "DIAL_RETRIES=0" in open(Path(__file__).resolve().parent.parent / ".env.example").read()
+    print("ok  one call per hotel: shared phone number dialed once, DIAL_RETRIES defaults to 0")
+
+
 async def t_prompt_email():
     """The address typed in the prompt wins over the LLM's copy and JUDGE_EMAIL; no address -> JUDGE_EMAIL."""
     import pipeline as pl
@@ -979,6 +1109,8 @@ async def main():
     await t_short_call()
     await t_recording()
     await t_race()
+    await t_rate_limits()
+    await t_one_call_each()
     await t_observability()
     await t_prompt_email()
     await t_mailer()

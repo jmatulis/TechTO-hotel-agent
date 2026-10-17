@@ -26,6 +26,7 @@ from datetime import date, timedelta
 
 import httpx
 
+import net
 import obs
 from ranker import distance_km as km
 from schemas import Hotel, HotelQuery
@@ -45,6 +46,7 @@ PLACES_KEY = E("GOOGLE_PLACES_KEY")
 SERPAPI_KEY = E("SERPAPI_KEY")
 GL = E("SERP_GL", "ca")
 CURRENCY = E("CURRENCY", "CAD")
+SERP_CONCURRENCY = int(E("SERP_CONCURRENCY", "5"))      # SerpApi plans cap requests per hour/second
 PLACES_FIELDS = "places.displayName,places.formattedAddress,places.internationalPhoneNumber"
 
 HTTP: httpx.AsyncClient = None  # type: ignore
@@ -54,8 +56,8 @@ COUNT = {"places": 0, "serpapi": 0}                    # billed requests, for th
 async def post(url: str, headers: dict, body: dict) -> dict:
     """Google Places POST; tests swap it out."""
     COUNT["places"] += 1
-    r = await HTTP.post(url, headers=headers, json=body)
-    r.raise_for_status()
+    r = await net.retry_429(lambda: HTTP.post(url, headers=headers, json=body), label="places")
+    net.fail(r, "places")
     return r.json()
 
 
@@ -63,8 +65,11 @@ async def serp(params: dict) -> dict:
     """SerpApi GET; tests swap it out."""
     COUNT["serpapi"] += 1
     with obs.span("serpapi", engine=params.get("engine"), kind="details" if "property_token" in params else "search"):
-        r = await HTTP.get("https://serpapi.com/search.json", params={**params, "api_key": SERPAPI_KEY})
-        r.raise_for_status()
+        async with net.gate("serpapi", SERP_CONCURRENCY):
+            r = await net.retry_429(
+                lambda: HTTP.get("https://serpapi.com/search.json", params={**params, "api_key": SERPAPI_KEY}),
+                label="serpapi")
+        net.fail(r, "serpapi")                   # not raise_for_status: its message would carry the api_key
         return r.json()
 
 
