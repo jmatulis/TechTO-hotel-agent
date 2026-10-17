@@ -32,12 +32,16 @@ details. The agent does not negotiate, and by default it doesn't take payment or
 | ------------------ | ------------------------------------------------------------------------------------ |
 | `agent.py`         | The whole agent: config, search, ranking, Twilio webhooks, call orchestration, email |
 | `tests/test-agent.py`    | Offline tests; every outside service is faked. **Run after every change.**           |
-| `pipeline.py`      | Prompt → Backboard parse → hotel_search → call cheapest `CALL_BATCH` → Backboard reads transcripts → cheapest confirmed; next batch if none |
-| `hotel_search.py`  | CLI: cheapest rates in a city via SerpApi Google Hotels, phones via details page / Places / Maps |
+| `pipeline.py`      | Prompt → Backboard parse → SerpApi + LiteAPI in parallel → `merge` + `rank` → call best `CALL_BATCH` → Backboard reads transcripts into `CallQuery` → `ranker.cheapest` (confirmed rooms only); next batch if none |
+| `hotel_search.py`  | SerpApi Google Hotels: cheapest rates, distance from centre, phones. CLI, `search()` (dicts) or `find_hotels()` (`Hotel` objects) |
+| `liteapi_search.py`| LiteAPI rates + Google Places phones/reviews → `find_hotels()` returns `Hotel` objects |
+| `schemas.py`       | pydantic models: `HotelQuery`, `Hotel`, `CallQuery` (transcript, summary, quoted price, available), `RankWeights` |
+| `ranker.py`        | `merge` (de-dupe across sources), `rank` (price × distance × review penalty), `final_rank`/`cheapest` (after the calls: `available is True` only, by quoted price). No API calls |
+| `tests/integ_pipeline.py` | Pipeline on six demo call transcripts with the real Backboard LLM; search and calls faked |
 | `tests/call_test.py`     | Dials one invented hotel: real call, no SerpApi, no email. Tune the call here         |
 | `README.md`        | Human-facing blueprint, API payloads, setup, checklist                               |
 | `.env.example`     | All config keys; copy to `.env` (never commit `.env`)                                |
-| `requirements.txt` | httpx[http2], fastapi, uvicorn, python-dotenv, python-multipart                      |
+| `requirements.txt` | httpx[http2], fastapi, uvicorn, python-dotenv, python-multipart, pydantic>=2         |
 
 ## How it runs (`main()` in agent.py)
 
@@ -117,6 +121,7 @@ redial), `unreachable`, `timeout`, `cancelled` (a better option won), `no_phone`
 ```bash
 pip install -r requirements.txt
 .venv/bin/python tests/test-agent.py                         # offline tests, no keys needed
+.venv/bin/python tests/integ_pipeline.py                  # demo transcripts through the real LLM (~3 calls, needs BACKBOARD_API_KEY)
 cloudflared tunnel --url http://localhost:8080         # or: ngrok http 8080 → PUBLIC_URL
 .venv/bin/python tests/call_test.py "Good Value Inn" 129      # ONE real call, no search, no email
 .venv/bin/python pipeline.py "King room in Toronto Oct 18-19 for 2, send to judge@x.com"   # full flow

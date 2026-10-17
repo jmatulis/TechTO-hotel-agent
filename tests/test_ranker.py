@@ -7,13 +7,43 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # project root,
 import asyncio
 
 import hotel_search as hs
-from ranker import rank
-from schemas import Hotel, RankWeights
+from ranker import cheapest, final_rank, merge, rank
+from schemas import CallQuery, Hotel, RankWeights
 
 
 def hotel(name, price, dist=10.0, rating=None, reviews=None):
     return Hotel(id=name, name=name, lat=0, lng=0, distance_km=dist, price=price, currency="CAD",
                  review_rating=rating, review_count=reviews)
+
+
+def test_merge_and_final_rank():
+    """merge(): one entry per hotel, cheapest price, gaps filled. final_rank(): confirmed rooms only."""
+    def h(name, price, source, lat=43.65, phone=None, **kw):
+        return Hotel(source=source, id=f"{source}-{name}", name=name, lat=lat, lng=-79.38, distance_km=1,
+                     price=price, currency="CAD", phone=phone, **kw)
+
+    serp = [h("The Skye Hotel & Residences", 120, "serpapi"), h("Alpha Inn", 90, "serpapi")]
+    lite = [h("Skye Hotel and Residences", 108, "liteapi", phone="+14165551111", review_rating=4.0, review_count=50),
+            h("Alpha Inn", 95, "liteapi", lat=44.5),              # same name, 100 km away: a different hotel
+            h("Beta Suites", 150, "liteapi")]
+    m = merge(serp, lite)
+    assert sorted(x.name for x in m) == ["Alpha Inn", "Alpha Inn", "Beta Suites", "Skye Hotel and Residences"], m
+    skye = next(x for x in m if "Skye" in x.name)
+    assert (skye.price, skye.source, skye.phone, skye.review_count) == (108, "liteapi", "+14165551111", 50), skye
+    # same phone but clearly different names (Places mismatch) is NOT merged
+    a, b = h("NU Hotel Toronto Airport", 106, "liteapi", phone="+19056777331"), h("Quality Inn", 117, "liteapi", phone="+19056777331")
+    assert len(merge([a], [b])) == 2
+
+    # final rank: available False / None are ignored; cheapest quote wins; no quote falls back to listing
+    def called(name, listed, available, quote=None):
+        x = h(name, listed, "serpapi")
+        x.call_query = CallQuery(available=available, price=quote)
+        return x
+    pool = [called("full", 80, False), called("unclear", 70, None), called("quoted-high", 90, True, 300),
+            called("quoted-low", 200, True, 180), h("never-called", 60, "serpapi"), called("no-quote", 170, True)]
+    assert [x.name for x in final_rank(pool)] == ["no-quote", "quoted-low", "quoted-high"], final_rank(pool)
+    assert cheapest(pool).name == "no-quote" and cheapest([called("full", 80, False)]) is None
+    print("merge + final_rank ok")
 
 
 def main():
@@ -67,4 +97,5 @@ async def serp_to_hotels():
 
 
 main()
+test_merge_and_final_rank()
 asyncio.run(serp_to_hotels())

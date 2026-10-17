@@ -117,6 +117,9 @@ class Candidate:
         self.check_out_time = prop.get("check_out_time")
         self.address = None
         self.phone = None
+        self.km = None            # distance from the city centre, when the search knew it
+        self.call = None          # schemas.CallQuery, filled once the transcript is read
+        self.hotel = None         # schemas.Hotel this candidate was built from (pipeline.py)
         # call state
         self.status = "queued"
         self.call_status = None
@@ -138,7 +141,7 @@ class Candidate:
 
     def summary(self) -> dict:
         return {"name": self.name, "listed_price": self.price, "phone": self.phone,
-                "status": self.status, "facts": self.facts, "attempts": self.attempts,
+                "distance_km": self.km, "status": self.status, "facts": self.facts, "attempts": self.attempts,
                 "call_seconds": self.billed_seconds}
 
 
@@ -616,6 +619,7 @@ def receipt(run: Run) -> tuple[str, str, str]:
         rate = f.get("price") or w.price
         rows += [
             ("Hotel", w.name), ("Address", w.address or "n/a"), ("Phone", w.phone or "n/a"),
+            ("Distance from city centre", f"{w.km:g} km" if w.km is not None else "n/a"),
             ("Nightly rate (confirmed by phone)", money(f.get("price")) if f.get("price") else "not stated"),
             ("Nightly rate (listed online)", money(w.price)),
             ("Estimated total before fees", money(round(float(rate) * n, 2))),
@@ -637,7 +641,8 @@ def receipt(run: Run) -> tuple[str, str, str]:
 
     checked = [c for c in run.cands if c.status not in ("queued",) or c.attempts]
     opt_rows = [(c.name, money(c.facts.get("price") or c.price), STATUS_TEXT.get(c.status, c.status),
-                 c.phone or "n/a", c.link or "n/a") for c in checked]
+                 f"{c.km:g} km" if c.km is not None else "n/a", c.phone or "n/a", c.link or "n/a")
+                for c in checked]
     transcript = [(m["role"], m["content"]) for m in (w.history if w else [])]
 
     def t(items):
@@ -646,7 +651,7 @@ def receipt(run: Run) -> tuple[str, str, str]:
             for r in items) + "</table>"
 
     html = (f"<h2>{escape(subject)}</h2>{t(rows)}"
-            f"<h3>Every option checked</h3>{t([('Hotel', 'Rate', 'Result', 'Phone', 'Link')] + opt_rows)}")
+            f"<h3>Every option checked</h3>{t([('Hotel', 'Rate', 'Result', 'Distance', 'Phone', 'Link')] + opt_rows)}")
     if transcript:
         html += "<h3>Call transcript</h3>" + "".join(
             f"<p><b>{'Hotel' if r == 'user' else 'Agent'}:</b> {escape(s)}</p>" for r, s in transcript)

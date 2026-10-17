@@ -437,9 +437,11 @@ async def t_pipeline():
     """Backboard parse -> search -> call batch of 3 -> transcripts read -> cheapest *quoted* wins.
     Round 1: nobody available -> round 2. A phone-less hotel is skipped and backfilled."""
     import hotel_search as hs
+    import liteapi_search as lite
     import pipeline as pl
+    from schemas import Hotel
 
-    saved = (agent.llm, agent.call_candidate, agent.tts, hs.serp, hs.PLACES_KEY)
+    saved = (agent.llm, agent.call_candidate, agent.tts, hs.serp, hs.PLACES_KEY, lite.find_hotels)
     agent.PHONE_OVERRIDE, hs.PLACES_KEY = "", ""
     pl.BATCH, pl.MAX_ROUNDS, pl.RADIUS_KM, pl.SEARCH_PAGES = 3, 3, 20, 1
     prices = {"H0": 90, "H1": 95, "H2": 99, "H3": 100, "H4": 104, "H5": 110, "H6": 120}
@@ -460,7 +462,8 @@ async def t_pipeline():
             name = block.split(": ", 1)[1].split(" (")[0]
             a, p = said[name]
             out.append({"id": idx, "available": a, "nightly_price": p, "total_price": None,
-                        "room_type": "King" if a else None, "check_in": None, "check_out": None})
+                        "room_type": "King" if a else None, "check_in": None, "check_out": None,
+                        "summary": f"{name} said " + ("yes" if a else "no")})
         return {"calls": out}
 
     async def fake_serp(params):
@@ -482,13 +485,23 @@ async def t_pipeline():
     async def fake_call(run_, c):
         dialed.append(c.name)
         c.attempts += 1
+        c.sid = "CA" + c.name.lower()
         c.history = [{"role": "user", "content": "Yes" if said[c.name][0] else "Sorry, we're full"}]
         c.status = "verified" if said[c.name][0] else "unavailable"   # live guess; transcript read wins
 
     async def no_tts(text):
         return None
 
+    async def fake_lite(q):
+        # the same H4, pricier than on SerpApi (2 nights x 104 = 208): the merge keeps the SerpApi price
+        # and takes this phone + reviews. LiteAPI-only hotels would simply be extra rows.
+        assert (q.city, q.check_in.isoformat(), q.currency) == ("Toronto", "2026-10-18", agent.CURRENCY)
+        return [Hotel(source="liteapi", id="lp4", name="H4", lat=43.66, lng=-79.39, distance_km=1.0,
+                      price=268, currency=agent.CURRENCY, phone="+14165559999", review_rating=4.3,
+                      review_count=900)]
+
     agent.llm, agent.call_candidate, agent.tts, hs.serp = fake_llm, fake_call, no_tts, fake_serp
+    lite.find_hotels = fake_lite
     try:
         agent.RUN = run = agent.Run("King room in Toronto Oct 18-20 for 2, send to judge@techto.ca")
         w = await pl.run_pipeline(run)
@@ -496,15 +509,51 @@ async def t_pipeline():
         assert "a king room" in agent.opener(run, run.cands[0])
         assert dialed == ["H0", "H1", "H2", "H4", "H5", "H6"], dialed          # H3 backfilled, Far out of radius
         assert "Far" not in [c.name for c in run.cands]
+        assert [c.name for c in run.cands].count("H4") == 1, "found by both searches: merged to one"
+        h4 = next(c for c in run.cands if c.name == "H4")
+        assert (h4.total, h4.phone, h4.rating, h4.reviews) == (208, "+14165559999", 4.3, 900), h4.summary()
         assert [c.status for c in run.cands if c.name == "H3"] == ["no_phone"]
         # H6 was listed highest but quoted lowest (125/night) -> it wins, total 250 for 2 nights
         assert w.name == "H6" and pl.stay_cost(run, w) == 250 and run.winner is w, w.name
         assert len(llm_log) == 3, "1 parse + 1 transcript read per round"
+        # the transcript read fills the CallQuery: summary, quoted stay price, availability
+        cq = w.call
+        assert (cq.summary, cq.price, cq.available) == ("H6 said yes", 250.0, True), cq
+        assert cq.call_url == "https://console.twilio.com/us1/monitor/logs/calls/CAh6", cq.call_url
+        assert "Hotel: Yes" in cq.transcript and cq.transcript.startswith("Agent:")
+        assert run.cands[0].call.available is False and run.cands[0].call.price is None
+        assert next(c for c in run.cands if c.name == "H3").call is None      # never reached a person
+        assert 0.5 < w.km < 1.5, w.km                                         # distance carried from search
+        assert w.summary()["distance_km"] == w.km
         rep = pl.report(run)
         assert rep["winner"]["name"] == "H6" and len(rep["called"]) == 7
+        h6 = next(x for x in rep["called"] if x["name"] == "H6")
+        assert h6["distance_km"] == w.km and h6["summary"] == "H6 said yes" and "Hotel: Yes" in h6["transcript"]
     finally:
-        agent.llm, agent.call_candidate, agent.tts, hs.serp, hs.PLACES_KEY = saved
+        agent.llm, agent.call_candidate, agent.tts, hs.serp, hs.PLACES_KEY, lite.find_hotels = saved
     print("ok  pipeline: parse, search, batch of 3, next batch when none free, cheapest quote wins")
+
+    # one search source down: carry on with the other; both down: fail loudly
+    async def boom(q, **kw):
+        raise RuntimeError("liteapi down")
+
+    async def ok_serp(q, **kw):
+        return [Hotel(source="serpapi", id="s", name="Only", price=100, currency="CAD", phone="+14165550000")]
+
+    saved = (hs.find_hotels, lite.find_hotels)
+    try:
+        hs.find_hotels, lite.find_hotels = ok_serp, boom
+        got = await pl.search({"city": "Toronto", "check_in": "2026-10-18", "check_out": "2026-10-19", "adults": 2})
+        assert [h.name for h in got] == ["Only"], got
+        hs.find_hotels = boom
+        try:
+            await pl.search({"city": "Toronto", "check_in": "2026-10-18", "check_out": "2026-10-19", "adults": 2})
+            raise AssertionError("both sources down should raise")
+        except RuntimeError:
+            pass
+    finally:
+        hs.find_hotels, lite.find_hotels = saved
+    print("ok  pipeline search: survives one source failing")
 
     # preflight: a dead tunnel must stop the run before anyone is dialed
     class FakeHTTP:
