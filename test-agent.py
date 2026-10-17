@@ -501,6 +501,32 @@ async def t_pipeline():
         agent.llm, agent.call_candidate, agent.tts, hs.serp, hs.PLACES_KEY = saved
     print("ok  pipeline: parse, search, batch of 3, next batch when none free, cheapest quote wins")
 
+    # preflight: a dead tunnel must stop the run before anyone is dialed
+    class FakeHTTP:
+        def __init__(self, result):
+            self.result = result
+
+        async def get(self, url, timeout=None):
+            if isinstance(self.result, Exception):
+                raise self.result
+            return type("R", (), {"status_code": self.result})()
+
+    saved_url, saved_http = agent.PUBLIC_URL, agent.HTTP
+    try:
+        agent.PUBLIC_URL = ""
+        assert "empty" in await pl.tunnel_ok()
+        agent.PUBLIC_URL = "https://dead.trycloudflare.com"
+        agent.HTTP = FakeHTTP(502)
+        assert "502" in await pl.tunnel_ok()
+        agent.HTTP = FakeHTTP(OSError("nxdomain"))
+        assert "unreachable" in await pl.tunnel_ok()
+        agent.HTTP = FakeHTTP(200)
+        assert await pl.tunnel_ok() is None
+        assert pl.report(agent.Run("stopped before parse"))["called"] == []
+    finally:
+        agent.PUBLIC_URL, agent.HTTP = saved_url, saved_http
+    print("ok  pipeline preflight: empty/dead/5xx tunnel caught before dialing")
+
 
 async def main():
     await t_hotel_search()

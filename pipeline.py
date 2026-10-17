@@ -215,7 +215,7 @@ async def run_pipeline(run: agent.Run) -> agent.Candidate | None:
 
 
 def report(run: agent.Run) -> dict:
-    n = agent.nights(run.req)
+    n = agent.nights(run.req) if run.req.get("check_in") else 1    # empty if we stopped before parsing
     called = [c for c in run.cands if c.attempts or c.status == "no_phone"]
     return {
         "request": run.req,
@@ -264,6 +264,18 @@ async def list_only(prompt: str, top: int = 10):
         await agent.HTTP.aclose()
 
 
+async def tunnel_ok() -> str | None:
+    """Fetch our own server through PUBLIC_URL. A dead tunnel otherwise shows up only as Twilio
+    saying 'an application error has occurred' on a live call. Returns the problem, or None."""
+    if not agent.PUBLIC_URL:
+        return "PUBLIC_URL is empty"
+    try:
+        r = await agent.HTTP.get(f"{agent.PUBLIC_URL}/audio/preflight", timeout=5)
+    except Exception as e:
+        return f"{agent.PUBLIC_URL} unreachable ({type(e).__name__})"
+    return None if r.status_code == 200 else f"{agent.PUBLIC_URL} answered HTTP {r.status_code}"
+
+
 async def main(prompt: str):
     preflight()
     agent.HTTP = hs.HTTP = httpx.AsyncClient(http2=True, timeout=15)
@@ -273,10 +285,21 @@ async def main(prompt: str):
     try:
         while not server.started:
             await asyncio.sleep(0.01)
+        if problem := await tunnel_ok():
+            raise SystemExit(f"tunnel check failed: {problem}. Start cloudflared "
+                             f"(--url http://localhost:{agent.PORT}) and put its URL in PUBLIC_URL.")
         await run_pipeline(run)
-        if run.req.get("email") and (agent.RESEND_KEY or agent.SMTP_USER):
-            await agent.send_receipt(run)
-            run.mark("email")
+        if not run.req.get("email"):
+            print("[email] skipped: no address in the prompt and JUDGE_EMAIL is empty", file=sys.stderr)
+        elif not (agent.RESEND_KEY or (agent.SMTP_USER and agent.SMTP_PASS)):
+            print("[email] skipped: set RESEND_API_KEY + MAIL_FROM, or SMTP_USER + SMTP_PASS", file=sys.stderr)
+        else:
+            try:
+                await agent.send_receipt(run)
+                run.mark("email")
+                print(f"[email] sent to {run.req['email']}", file=sys.stderr)
+            except Exception as e:      # keep the report: the calls already cost money
+                print(f"[email] FAILED: {e!r}", file=sys.stderr)
     finally:
         print(json.dumps(report(run), indent=2, default=str))
         await asyncio.sleep(1.0)                    # let Twilio's last /status callbacks land
