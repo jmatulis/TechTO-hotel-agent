@@ -30,7 +30,7 @@ async def t_parse():
     agent.RUN = agent.Run("x")
     calls = []
 
-    async def fake_llm(m, max_tokens=90):
+    async def fake_llm(m):
         calls.append(m)
         return {"city": "Montreal", "check_in": "2026-10-23", "check_out": "2026-10-25", "adults": 2}
 
@@ -168,7 +168,7 @@ async def t_webhook_and_email():
     ])
     nope = iter([{"say": "Understood, thanks anyway. Goodbye!", "done": True, "available": False}])
 
-    async def fake_llm(m, max_tokens=110):
+    async def fake_llm(m):
         return next(nope) if other.name in m[0]["content"] else next(script)
 
     agent.llm = fake_llm
@@ -201,8 +201,9 @@ async def t_webhook_and_email():
 
 
 class FakeResp:
-    def __init__(self, payload):
+    def __init__(self, payload, content=b""):
         self._p = payload
+        self.content = content
 
     def raise_for_status(self):
         pass
@@ -211,8 +212,8 @@ class FakeResp:
         return self._p
 
 
-async def t_llm_backends():
-    """Both wire formats: request shape, token accounting, lenient JSON."""
+async def t_llm():
+    """Backboard wire format: request shape, token accounting, lenient JSON, 200-FAILED."""
     sent = []
 
     class FakeHTTP:
@@ -228,23 +229,10 @@ async def t_llm_backends():
             {"role": "assistant", "content": "how much?"},
             {"role": "user", "content": "one forty"}]
 
-    # --- OpenAI-compatible (Groq) path
     agent.RUN = agent.Run("x")
-    agent.LLM_BACKEND = "openai"
-    agent.HTTP = FakeHTTP({"choices": [{"message": {"content": '{"say":"ok","done":true}'}}],
-                           "usage": {"prompt_tokens": 40, "completion_tokens": 7}})
-    out = await REAL_LLM(msgs)
-    url, headers, body = sent[-1]
-    assert out == {"say": "ok", "done": True}, out
-    assert url.endswith("/chat/completions") and body["messages"] == msgs, body
-    assert body["max_tokens"] == 110 and headers["Authorization"].startswith("Bearer ")
-    assert (agent.RUN.tok_in, agent.RUN.tok_out, agent.RUN.llm_calls) == (40, 7, 1)
-
-    # --- Backboard path
-    agent.RUN = agent.Run("x")
-    agent.LLM_BACKEND = "backboard"
-    agent.BB_PROVIDER, agent.BB_MODEL, agent.BB_KEY = "openrouter", "fast/model", "k"
-    agent.HTTP = FakeHTTP({"message": '```json\n{"say":"ok","available":true}\n```',
+    agent.BB_PROVIDER, agent.BB_MODEL, agent.BB_KEY = "cerebras", "openai/gpt-oss-120b", "k"
+    agent.HTTP = FakeHTTP({"message": "Message added successfully",
+                           "content": '```json\n{"say":"ok","available":true}\n```',
                            "input_tokens": 52, "output_tokens": 9, "thread_id": "th_1"})
     out = await REAL_LLM(msgs)
     url, headers, body = sent[-1]
@@ -252,7 +240,8 @@ async def t_llm_backends():
     assert url.endswith("/threads/messages") and headers["X-API-Key"] == "k", (url, headers)
     assert body["system_prompt"] == "be brief", body                         # system hoisted out
     assert "thread_id" not in body and body["memory"] == "off", body          # stateless: no memory tax
-    assert body["json_output"] is True and body["llm_provider"] == "openrouter"
+    assert body["json_output"] is True and body["llm_provider"] == "cerebras"
+    assert body["model_name"] == "openai/gpt-oss-120b", body
     assert body["content"].splitlines() == ["Hotel: we have a room", "You: how much?", "Hotel: one forty"], body
     assert (agent.RUN.tok_in, agent.RUN.tok_out, agent.RUN.llm_calls) == (52, 9, 1)
 
@@ -260,7 +249,7 @@ async def t_llm_backends():
     await REAL_LLM([{"role": "user", "content": "find me a hotel"}])
     assert sent[-1][2]["content"] == "find me a hotel" and "system_prompt" not in sent[-1][2]
 
-    # Backboard reports upstream model failures as HTTP 200 + status FAILED
+    # upstream model failures arrive as HTTP 200 + status FAILED, not an HTTP error
     agent.HTTP = FakeHTTP({"message": "Message added successfully", "status": "FAILED",
                            "content": "LLM Error: LLM Invocation Error: Error code: 404"})
     try:
@@ -269,13 +258,66 @@ async def t_llm_backends():
     except RuntimeError as e:
         assert "backboard" in str(e), e
 
-    agent.LLM_BACKEND = "openai"
-    print("ok  llm backends: openai-compatible + backboard, stateless, tokens, 200-FAILED")
+    print("ok  llm: backboard stateless call, tokens counted, 200-FAILED raises")
+
+
+async def t_tts():
+    """ElevenLabs TTS: <Play> when it works, <Say> fallback when it doesn't, caching, /audio route."""
+    agent.RUN = agent.Run("x")
+    agent.AUDIO.clear()
+    agent.PUBLIC_URL, agent.EL_KEY, agent.EL_MODE = "https://tunnel.test", "el-key", "all"
+    posts = []
+
+    class FakeHTTP:
+        def __init__(self, fail=False):
+            self.fail = fail
+
+        async def post(self, url, headers=None, params=None, json=None, timeout=None, **kw):
+            posts.append((url, headers, params, json))
+            if self.fail:
+                raise RuntimeError("eleven down")
+            return FakeResp(None, content=b"ID3-fake-mp3")
+
+    agent.HTTP = FakeHTTP()
+    cand = agent.rank(PROPS)[0]
+    xml = await agent.gather(cand, "Do you have a room?")
+    url, headers, params, body = posts[-1]
+    assert "<Play>https://tunnel.test/audio/" in xml and "<Say" not in xml, xml
+    assert url.endswith(f"/text-to-speech/{agent.EL_VOICE}") and headers["xi-api-key"] == "el-key"
+    assert body["model_id"] == agent.EL_MODEL and params["output_format"] == agent.EL_FORMAT
+    assert '<Gather input="speech"' in xml and "/turn?c=" in xml
+    assert (agent.RUN.tts_calls, agent.RUN.tts_chars) == (1, len("Do you have a room?"))
+
+    # same text again -> served from cache, no second API call
+    before = len(posts)
+    await agent.hangup_twiml("Do you have a room?")
+    assert len(posts) == before and agent.RUN.tts_calls == 1
+
+    # the mp3 is reachable on the tunnel for Twilio to <Play>
+    key = agent._akey("Do you have a room?")
+    assert agent.AUDIO[key] == b"ID3-fake-mp3"
+
+    # TTS failure must never kill the line: fall back to <Say>
+    agent.HTTP = FakeHTTP(fail=True)
+    xml = await agent.gather(cand, "A line we have not generated")
+    assert "<Say voice=" in xml and "<Play>" not in xml, xml
+
+    # mode "opener" only plays pre-generated audio, everything else is <Say>
+    agent.HTTP = FakeHTTP()
+    agent.EL_MODE = "opener"
+    xml = await agent.gather(cand, "Do you have a room?")          # cached -> Play
+    assert "<Play>" in xml, xml
+    xml = await agent.gather(cand, "An unplanned mid-call line")   # not cached -> Say
+    assert "<Say voice=" in xml, xml
+
+    agent.EL_MODE, agent.EL_KEY = "all", ""
+    print("ok  tts: eleven <Play>, cache hit, failure falls back to <Say>, opener-only mode")
 
 
 async def main():
     await t_parse()
-    await t_llm_backends()
+    await t_llm()
+    await t_tts()
     t_rank_phone()
     await t_shortlist()
     await t_verify_parallel()

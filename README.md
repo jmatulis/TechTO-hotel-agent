@@ -74,7 +74,7 @@ If nothing could be verified, the email still goes out marked `[NOT VERIFIED]`, 
 | "No availability" ends the call at once              | No wasted turns on dead options                                 |
 | Regex parse, deterministic ranking, templated opener | Zero tokens outside the conversations                           |
 | Inline `Twiml` on call create                        | No webhook round trip before the hotel hears anything           |
-| History capped at 6 messages, `max_tokens=110`       | Flat token cost per turn                                        |
+| History capped at 6 messages, stateless `memory: "off"` | We pay only for the window we send, never Backboard-side state |
 | HTTP/2 + pre-warmed connections                      | TLS handshakes off the critical path                            |
 
 ## API payloads
@@ -101,6 +101,37 @@ StatusCallback={PUBLIC_URL}/status?c=2  StatusCallbackEvent=completed  Timeout=2
 The `?c=<index>` on both URLs is how the server knows which hotel's conversation a webhook belongs to.
 
 **Twilio hang-up** (`POST …/Calls/{CallSid}.json`, `Status=completed`) is used for early stop and timeouts.
+
+**Backboard message** (`POST https://app.backboard.io/api/threads/messages`, header `X-API-Key`)
+
+```json
+{
+  "content": "Hotel: we have a queen\nYou: how much?\nHotel: one twenty nine",
+  "system_prompt": "<system_prompt(run, c)>",
+  "json_output": true,
+  "memory": "off",
+  "stream": false,
+  "llm_provider": "cerebras",
+  "model_name": "openai/gpt-oss-120b"
+}
+```
+
+No `thread_id`, so each turn is stateless and we send our own 6-message window. Reply fields used:
+`content` (the JSON below), `input_tokens`, `output_tokens`, and `status` — which is `"FAILED"`,
+on an HTTP **200**, when the upstream model errors. Measured ~0.8s/turn, ~$0.0003/turn.
+Spend to date: `GET /api/billing/usage/summary`.
+
+**ElevenLabs TTS** (`POST https://api.elevenlabs.io/v1/text-to-speech/{voice_id}`, header `xi-api-key`)
+
+```
+?output_format=mp3_22050_32      {"text": "<the line>", "model_id": "eleven_flash_v2_5"}
+```
+
+Returns raw MP3, cached in `AUDIO` under a hash of the text and served by `GET /audio/{key}` so
+Twilio can `<Play>` it off the tunnel. Openers are generated during `pick_shortlist()`, in parallel
+with the phone lookups, so they add no latency at call time. Any failure or timeout falls back to
+`<Say voice=TTS_VOICE>` - the line never goes dead. `ELEVEN_MODE=opener` restricts `<Play>` to
+pre-generated openers; `off` disables it entirely.
 
 **LLM reply contract**
 
@@ -139,11 +170,13 @@ with "sorry, we're fully booked", then confirm the second one.
 
 - [ ] Twilio account **upgraded** (trial accounts can only dial verified numbers, and they play a preamble)
 - [ ] Twilio Geo Permissions allow Canada/US
-- [ ] Confirm the current Groq model ID (`LLM_MODEL`)
+- [ ] Confirm `BACKBOARD_MODEL` still routes: one live call, not just a catalogue listing
+      (`GET /api/models/provider/cerebras`). A 200 with `status: "FAILED"` is the failure mode.
 - [ ] SerpApi credits: each run uses about 1 + K lookups (a few more if hotels lack phone numbers)
 - [ ] Tunnel up, and `PUBLIC_URL` matches it
 - [ ] Test receipt lands in the inbox, not spam
-- [ ] One real end-to-end test with `PHONE_OVERRIDE`
+- [ ] One real end-to-end test with `PHONE_OVERRIDE` - listen for the ElevenLabs voice on the
+      opener; if you hear Polly instead, `<Play>` failed and it fell back
 - [ ] Ask the organizers: do agents call the real hotels, or a judge-run line? If it's one line,
       set `PHONE_OVERRIDE` to it (calls then go out one at a time so they don't collide)
 

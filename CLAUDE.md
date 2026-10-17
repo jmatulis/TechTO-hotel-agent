@@ -19,13 +19,19 @@ details. The agent does not negotiate, and by default it doesn't take payment or
 - **No browser automation**: no Selenium, Playwright, Puppeteer, headless Chrome.
 - Must make a **real phone call** and must deliver an **email** to the provided address.
 - Public foundation models via API only.
+- **Backboard is the model layer**, used as the Unified API over plain HTTP (`httpx`). Their Studio,
+  SDK (`backboard-sdk`) and R-CLI are dev-time tools at most and must never be in the shipped path:
+  R-CLI is itself a coding agent, which is exactly what the no-frameworks rule bans.
+- **ElevenLabs is the voice layer** (hackathon sponsor, credits provided): their raw TTS HTTP API
+  only. **Never ElevenLabs Agents** - that product runs the whole call loop and is the same category
+  as Vapi/Retell/Bland, i.e. a disqualification. STT stays Twilio `<Gather input="speech">`.
 
 ## Files
 
 | File               | What it is                                                                           |
 | ------------------ | ------------------------------------------------------------------------------------ |
 | `agent.py`         | The whole agent: config, search, ranking, Twilio webhooks, call orchestration, email |
-| `test_agent.py`    | Offline tests; every outside service is faked. **Run after every change.**           |
+| `test-agent.py`    | Offline tests; every outside service is faked. **Run after every change.**           |
 | `README.md`        | Human-facing blueprint, API payloads, setup, checklist                               |
 | `.env.example`     | All config keys; copy to `.env` (never commit `.env`)                                |
 | `requirements.txt` | httpx[http2], fastapi, uvicorn, python-dotenv, python-multipart                      |
@@ -46,7 +52,15 @@ of the same loop so Twilio can call back into it through a public tunnel.
 5. **`verify_all()`**: calls the shortlist **in parallel**.
    - Each call: Twilio REST create-call with the opening line as **inline TwiML** (`Twiml` param), so
      there's no webhook hop before it speaks. Twilio `<Gather input="speech">` does speech-to-text and
-     POSTs to `/turn?c=<idx>`. We ask the LLM for the next line and answer with `<Say>` (Twilio TTS).
+     POSTs to `/turn?c=<idx>`. We ask the LLM for the next line and speak it back.
+   - **Voice**: `voice_el()` returns `<Play>{PUBLIC_URL}/audio/<key}></Play>` for ElevenLabs audio,
+     falling back to Twilio `<Say voice=TTS_VOICE>` whenever ElevenLabs is off, uncached in
+     `opener` mode, or erroring. MP3s live in the in-process `AUDIO` dict and are served by
+     `GET /audio/{key}` through the same tunnel, keyed by a hash of the text so repeated lines
+     ("Sorry, I didn't catch that") are synthesized once. **Openers are pre-generated inside
+     `pick_shortlist()`, concurrently with the SerpApi phone lookups**, so the first and most
+     important line costs no latency at call time. `ELEVEN_MODE=all|opener|off` trades voice
+     quality against per-turn latency; `ELEVEN_TIMEOUT` bounds the stall before falling back.
    - `?c=<idx>` on `/turn` and `/status` identifies which hotel's call a webhook belongs to
      (`run.cands[idx]`). Each `Candidate` holds its own history, facts and status.
    - **`decide()`**: walk the shortlist in rank order. The first `verified` hotel wins once every
@@ -60,8 +74,12 @@ of the same loop so Twilio can call back into it through a public tunnel.
 
 ### LLM contract (per conversation turn)
 
-Groq (OpenAI-compatible) `/chat/completions`, `response_format: json_object`, `max_tokens=110`,
-history capped at the last 6 messages. The model must reply only with:
+Backboard Unified API: `POST https://app.backboard.io/api/threads/messages`, auth header
+`X-API-Key`, with `json_output: true` and `memory: "off"`. No `thread_id` is sent, so every request
+is stateless and we keep paying only for our own window: history capped at the last 6 messages.
+`llm()` hoists the system message into `system_prompt` and flattens the rest to `Hotel:` / `You:`
+lines, since the API takes a single `content` string. Tokens come back as `input_tokens` /
+`output_tokens`. The model must reply only with:
 
 ```json
 {"say":"<=25 words","done":bool,"available":bool|null,"price":number|null,"fees":str|null,
@@ -79,11 +97,14 @@ redial), `unreachable`, `timeout`, `cancelled` (a better option won), `no_phone`
 
 ## Config (`.env`)
 
-`PUBLIC_URL` (tunnel URL, must be current), `PORT`, `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`
-(default `llama-3.1-8b-instant`; **check it's still listed on Groq**), `SERPAPI_KEY`, `CURRENCY=CAD`,
+`PUBLIC_URL` (tunnel URL, must be current), `PORT`, `BACKBOARD_API_KEY`, `BACKBOARD_BASE_URL`,
+`BACKBOARD_PROVIDER` (default `cerebras`), `BACKBOARD_MODEL` (default `openai/gpt-oss-120b`),
+`SERPAPI_KEY`, `CURRENCY=CAD`,
 `SERP_GL=ca`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM`, `PHONE_OVERRIDE`, `TOP_K`,
 `HOLD_ON_CALL` (1 = accept a hold or reservation if the hotel offers one), `TTS_VOICE`,
 `SPEECH_TIMEOUT`, `MAX_TURNS`, `CALL_TIMEOUT`, `DIAL_RETRIES`, `GUEST_NAME`, `JUDGE_EMAIL`,
+`ELEVEN_API_KEY`, `ELEVEN_VOICE_ID`, `ELEVEN_MODEL` (default `eleven_flash_v2_5`), `ELEVEN_FORMAT`,
+`ELEVEN_MODE`, `ELEVEN_TIMEOUT`,
 `RESEND_API_KEY`, `MAIL_FROM`, `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`.
 
 ## Commands
@@ -144,7 +165,16 @@ Test the multi-call flow on your own phone: set `PHONE_OVERRIDE=<cell>`, answer 
 
 - Twilio **trial accounts** can only dial verified numbers and play a preamble. Upgrade first.
 - A stale `PUBLIC_URL` means the opener plays and then the call goes nowhere (no `/turn` webhooks arrive).
-- Groq model IDs get retired; a 404 from the LLM usually means a bad `LLM_MODEL`.
+  With ElevenLabs on, a stale `PUBLIC_URL` also breaks `<Play>`, so the hotel hears **silence**
+  instead of a wrong-but-audible voice. Check the tunnel first when a call goes quiet.
+- `AUDIO` is in-process, so audio only survives for the life of the run - which is all we need.
+- **Backboard returns HTTP 200 even when the upstream model fails**: `status: "FAILED"` with the
+  error text in `content`, so `raise_for_status()` misses it. `llm()` checks for this and raises.
+- Model IDs must *route*, not just exist in the catalogue. `meta-llama/llama-3.1-8b-instruct` is
+  listed under `cerebras` but 404s ("every candidate endpoint was removed during routing").
+  Verify with `GET /api/models/provider/cerebras` and one live call before the bake-off.
+- The chat API has **no `max_tokens`**. Brevity comes only from the prompt's `<=25 words`;
+  gpt-oss-120b spends ~330 output tokens/turn on hidden reasoning.
 - If Twilio rejects `<Gather>` options, try `SPEECH_TIMEOUT=1` instead of `auto`.
 - STT mangles spelled-out reference numbers ("T X 4 4 7 1"); have the agent read them back.
 - `RUN` is global: one run per process, which is all the bake-off needs.

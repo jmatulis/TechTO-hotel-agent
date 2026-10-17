@@ -17,6 +17,7 @@ Test: set PHONE_OVERRIDE=<your cell> -> every call goes to you, one at a time, b
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -44,15 +45,10 @@ E = os.environ.get
 PUBLIC_URL = E("PUBLIC_URL", "").rstrip("/")          # ngrok / cloudflared URL -> PORT
 PORT = int(E("PORT", "8080"))
 
-LLM_BASE = E("LLM_BASE_URL", "https://api.groq.com/openai/v1")  # any OpenAI-compatible endpoint
-LLM_KEY = E("LLM_API_KEY", "")
-LLM_MODEL = E("LLM_MODEL", "llama-3.1-8b-instant")    # check Groq's current model list the morning of
-
-LLM_BACKEND = E("LLM_BACKEND", "openai").lower()      # "openai" = any OpenAI-compatible (Groq); "backboard"
 BB_BASE = E("BACKBOARD_BASE_URL", "https://app.backboard.io/api").rstrip("/")
 BB_KEY = E("BACKBOARD_API_KEY", "")
-BB_PROVIDER = E("BACKBOARD_PROVIDER", "")             # openai | anthropic | google | openrouter; blank = their default
-BB_MODEL = E("BACKBOARD_MODEL", "")                   # blank = their default gpt-4o, which is SLOW for a live call
+BB_PROVIDER = E("BACKBOARD_PROVIDER", "cerebras")     # fastest of the 12; see models/providers
+BB_MODEL = E("BACKBOARD_MODEL", "openai/gpt-oss-120b")  # 0.8s/turn measured; verify it still routes
 
 SERPAPI_KEY = E("SERPAPI_KEY", "")
 CURRENCY = E("CURRENCY", "CAD")
@@ -63,7 +59,15 @@ TW_TOKEN = E("TWILIO_AUTH_TOKEN", "")
 TW_FROM = E("TWILIO_FROM", "")
 PHONE_OVERRIDE = E("PHONE_OVERRIDE", "")              # set -> all calls go here, sequentially (testing / judge line)
 TOP_K = int(E("TOP_K", "3"))                          # how many hotels to verify by phone
-VOICE = E("TTS_VOICE", "Polly.Joanna-Neural")
+VOICE = E("TTS_VOICE", "Polly.Joanna-Neural")          # fallback only, when ElevenLabs is off or fails
+
+# ElevenLabs TTS (sponsor stack). Raw TTS over HTTP only - never their Agents product.
+EL_KEY = E("ELEVEN_API_KEY", "")
+EL_VOICE = E("ELEVEN_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")   # Rachel; swap for whichever you prefer
+EL_MODEL = E("ELEVEN_MODEL", "eleven_flash_v2_5")         # flash = lowest latency tier
+EL_FORMAT = E("ELEVEN_FORMAT", "mp3_22050_32")            # small file -> Twilio fetches it fast
+EL_MODE = E("ELEVEN_MODE", "all").lower()                 # all | opener | off
+EL_TIMEOUT = float(E("ELEVEN_TIMEOUT", "4"))              # past this we fall back rather than stall the call
 SPEECH_TIMEOUT = E("SPEECH_TIMEOUT", "auto")          # "auto" or seconds, e.g. "1"
 MAX_TURNS = int(E("MAX_TURNS", "6"))
 CALL_TIMEOUT = float(E("CALL_TIMEOUT", "120"))        # per call attempt
@@ -129,6 +133,7 @@ class Run:
         self.cands: list[Candidate] = []
         self.winner: Candidate | None = None
         self.tok_in = self.tok_out = self.llm_calls = self.serp_calls = 0
+        self.tts_calls = self.tts_chars = 0
         self.t0 = time.perf_counter()
         self.marks: dict = {}
 
@@ -142,31 +147,9 @@ app = FastAPI()
 
 
 # ---------------------------------------------------------------- LLM
-async def llm(messages: list, max_tokens: int = 110) -> dict:
-    """One seam for every model call. LLM_BACKEND picks the wire format."""
-    impl = _llm_backboard if LLM_BACKEND == "backboard" else _llm_openai
-    return await impl(messages, max_tokens)
-
-
-async def _llm_openai(messages: list, max_tokens: int) -> dict:
-    r = await HTTP.post(
-        f"{LLM_BASE}/chat/completions",
-        headers={"Authorization": f"Bearer {LLM_KEY}"},
-        json={"model": LLM_MODEL, "messages": messages, "max_tokens": max_tokens,
-              "temperature": 0.2, "response_format": {"type": "json_object"}},
-    )
-    r.raise_for_status()
-    j = r.json()
-    u = j.get("usage") or {}
-    RUN.tok_in += u.get("prompt_tokens", 0)
-    RUN.tok_out += u.get("completion_tokens", 0)
-    RUN.llm_calls += 1
-    return json.loads(j["choices"][0]["message"]["content"])
-
-
-async def _llm_backboard(messages: list, max_tokens: int) -> dict:
-    """POST /threads/messages. No thread_id + memory off = stateless, so we keep
-    sending our own capped window and the token bill stays what it is today.
+async def llm(messages: list) -> dict:
+    """Backboard POST /threads/messages. No thread_id + memory off = stateless, so we
+    send our own capped window and pay for nothing we didn't send.
     Their API has no max_tokens: brevity is enforced by the prompt alone."""
     sys_p = " ".join(m["content"] for m in messages if m["role"] == "system")
     turns = [m for m in messages if m["role"] != "system"]
@@ -240,7 +223,7 @@ async def parse_request(prompt: str) -> dict:
             '{"city":str,"check_in":"YYYY-MM-DD","check_out":"YYYY-MM-DD","adults":int}. '
             "Default 1 night starting tomorrow, 1 adult.")},
         {"role": "user", "content": prompt},
-    ], max_tokens=60)
+    ])
     req.update({k: v for k, v in out.items() if v and k in req})
     return req
 
@@ -319,23 +302,72 @@ async def pick_shortlist(run: Run) -> list[Candidate]:
     while len(short) < TOP_K and i < len(pool):
         batch = pool[i:i + (TOP_K - len(short))]
         i += len(batch)
-        await asyncio.gather(*(enrich(c, run.req) for c in batch))
+        # opener text needs only name/price/req, so its audio can be built
+        # concurrently with the phone-number lookups - free latency.
+        await asyncio.gather(*(enrich(c, run.req) for c in batch),
+                             *(tts(opener(run, c)) for c in batch))
         short += [c for c in batch if c.status != "no_phone"]
     return short
 
 
 # ---------------------------------------------------------------- step 3: verification calls
-def gather(c: Candidate, say: str) -> str:
+AUDIO: dict[str, bytes] = {}                          # key -> mp3, served from /audio/<key>
+
+
+def _akey(text: str) -> str:
+    return hashlib.sha1(text.encode()).hexdigest()[:16]
+
+
+async def tts(text: str) -> str | None:
+    """ElevenLabs -> cached mp3. Returns the audio key, or None to fall back to <Say>."""
+    if not (EL_KEY and PUBLIC_URL) or EL_MODE == "off":
+        return None
+    key = _akey(text)
+    if key in AUDIO:                                   # repeated lines cost nothing
+        return key
+    try:
+        r = await HTTP.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{EL_VOICE}",
+            headers={"xi-api-key": EL_KEY},
+            params={"output_format": EL_FORMAT},
+            json={"text": text, "model_id": EL_MODEL},
+            timeout=EL_TIMEOUT,
+        )
+        r.raise_for_status()
+    except Exception as e:                             # never stall a live call for TTS
+        print(f"[tts] {e!r}", file=sys.stderr)
+        return None
+    AUDIO[key] = r.content
+    RUN.tts_calls += 1
+    RUN.tts_chars += len(text)
+    return key
+
+
+async def voice_el(text: str) -> str:
+    """<Play> ElevenLabs audio when we have it, else Twilio's own <Say>."""
+    if EL_MODE == "all" or (EL_MODE == "opener" and _akey(text) in AUDIO):
+        key = await tts(text)
+        if key:
+            return f"<Play>{PUBLIC_URL}/audio/{key}</Play>"
+    return f'<Say voice="{VOICE}">{escape(text)}</Say>'
+
+
+@app.get("/audio/{key}")
+async def audio(key: str):
+    return Response(content=AUDIO.get(key, b""), media_type="audio/mpeg")
+
+
+async def gather(c: Candidate, say: str) -> str:
     return (
         f'<Response><Gather input="speech" action="{PUBLIC_URL}/turn?c={c.idx}" method="POST" '
         f'speechTimeout="{SPEECH_TIMEOUT}" speechModel="phone_call" enhanced="true" '
         f'actionOnEmptyResult="true" language="en-US">'
-        f'<Say voice="{VOICE}">{escape(say)}</Say></Gather></Response>'
+        f'{await voice_el(say)}</Gather></Response>'
     )
 
 
-def hangup_twiml(say: str) -> str:
-    return f'<Response><Say voice="{VOICE}">{escape(say)}</Say><Hangup/></Response>'
+async def hangup_twiml(say: str) -> str:
+    return f"<Response>{await voice_el(say)}<Hangup/></Response>"
 
 
 def xml(body: str) -> Response:
@@ -404,8 +436,8 @@ async def turn(request: Request):
         c.silent += 1
         if c.silent >= 2:
             finish(c)
-            return xml(hangup_twiml("Sorry, I'm having trouble hearing you. Thank you, goodbye."))
-        return xml(gather(c, "Sorry, I didn't catch that. Could you say that again?"))
+            return xml(await hangup_twiml("Sorry, I'm having trouble hearing you. Thank you, goodbye."))
+        return xml(await gather(c, "Sorry, I didn't catch that. Could you say that again?"))
 
     c.silent = 0
     c.history.append({"role": "user", "content": heard})
@@ -423,8 +455,8 @@ async def turn(request: Request):
 
     if out.get("done") or c.facts.get("available") is False or c.turns >= MAX_TURNS:
         finish(c)
-        return xml(hangup_twiml(say))
-    return xml(gather(c, say))
+        return xml(await hangup_twiml(say))
+    return xml(await gather(c, say))
 
 
 @app.post("/status")
@@ -446,7 +478,7 @@ async def place_call(run: Run, c: Candidate) -> str:
     r = await HTTP.post(
         TW_CALLS.format(sid=TW_SID) + ".json", auth=(TW_SID, TW_TOKEN),
         data={"To": PHONE_OVERRIDE or c.phone, "From": TW_FROM,
-              "Twiml": gather(c, opener(run, c)),         # inline: no webhook hop before speaking
+              "Twiml": await gather(c, opener(run, c)),   # inline: no webhook hop before speaking
               "StatusCallback": f"{PUBLIC_URL}/status?c={c.idx}",
               "StatusCallbackEvent": "completed", "Timeout": "20"},
     )
@@ -618,7 +650,7 @@ async def send_receipt(run: Run):
 
 # ---------------------------------------------------------------- orchestrator
 async def warm():
-    urls = ["https://serpapi.com/", f"{LLM_BASE}/models", "https://api.twilio.com/"]
+    urls = ["https://serpapi.com/", f"{BB_BASE}/models/providers", "https://api.twilio.com/"]
     if RESEND_KEY:
         urls.append("https://api.resend.com/")
     await asyncio.gather(*(HTTP.head(u, timeout=5) for u in urls), return_exceptions=True)
@@ -661,6 +693,7 @@ async def main(prompt: str):
             "timings_s": run.marks,
             "llm_calls": run.llm_calls, "serpapi_calls": run.serp_calls,
             "tokens": {"in": run.tok_in, "out": run.tok_out},
+            "tts": {"calls": run.tts_calls, "chars": run.tts_chars, "cached": len(AUDIO)},
             "call_seconds": sum(c.seconds for c in run.cands),
         }, indent=2, default=str))
         await asyncio.sleep(0.5)  # let Twilio deliver the last status callbacks
