@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from datetime import date, datetime, timedelta
 
 import httpx
@@ -27,6 +28,7 @@ import hotel_search as hs
 import liteapi_search as lite
 import ranker
 from schemas import CallQuery, Hotel, HotelQuery
+import mailer
 
 E = agent.E
 BATCH = int(E("CALL_BATCH", "3"))              # hotels phoned per round
@@ -299,6 +301,29 @@ def hotel_table(hotels: list[Hotel], req: dict) -> str:
     return "\n".join(out)
 
 
+def email_items(run: agent.Run) -> tuple[dict, dict | None, list[dict], dict]:
+    """Run state -> the plain dicts mailer.build() takes."""
+    n = agent.nights(run.req)
+
+    def item(c: agent.Candidate) -> dict:
+        f = c.facts
+        return {"name": c.name, "address": c.address, "phone": c.phone, "km": getattr(c, "km", None),
+                "listed_night": c.price, "quoted_night": f.get("price"), "quoted_total": f.get("total"),
+                "fees": f.get("fees"), "room_type": f.get("room_type"), "cancellation": f.get("cancellation"),
+                "reference": f.get("reference"), "status": c.status, "verified_at": c.verified_at,
+                "transcript": transcript(run, c) if c.history else None}
+
+    called = [c for c in run.cands if c.attempts or c.status == "no_phone"]
+    items = {c.idx: item(c) for c in called}
+    winner = items.get(run.winner.idx) if run.winner else None
+    stats = {"Total run time (s)": round(time.perf_counter() - run.t0, 1),
+             "Hotels phoned": sum(1 for c in called if c.attempts),
+             "Call minutes": round(sum(c.billed_seconds for c in run.cands) / 60, 2),
+             "LLM calls / tokens in / out": f"{run.llm_calls} / {run.tok_in} / {run.tok_out}",
+             "SerpApi requests": hs.COUNT["serpapi"]}
+    return {**run.req, "nights": n}, winner, list(items.values()), stats
+
+
 async def list_only(prompt: str, top: int = 10):
     """Parse + search + phones, print the table, phone nobody."""
     preflight(calling=False)
@@ -343,11 +368,11 @@ async def main(prompt: str):
         await run_pipeline(run)
         if not run.req.get("email"):
             print("[email] skipped: no address in the prompt and JUDGE_EMAIL is empty", file=sys.stderr)
-        elif not (agent.RESEND_KEY or (agent.SMTP_USER and agent.SMTP_PASS)):
-            print("[email] skipped: set RESEND_API_KEY + MAIL_FROM, or SMTP_USER + SMTP_PASS", file=sys.stderr)
+        elif problem := mailer.configured():
+            print(f"[email] skipped: {problem}", file=sys.stderr)
         else:
             try:
-                await agent.send_receipt(run)
+                await mailer.send(run.req["email"], *mailer.build(*email_items(run)), client=agent.HTTP)
                 run.mark("email")
                 print(f"[email] sent to {run.req['email']}", file=sys.stderr)
             except Exception as e:      # keep the report: the calls already cost money

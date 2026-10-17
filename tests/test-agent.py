@@ -529,6 +529,14 @@ async def t_pipeline():
         assert rep["winner"]["name"] == "H6" and len(rep["called"]) == 7
         h6 = next(x for x in rep["called"] if x["name"] == "H6")
         assert h6["distance_km"] == w.km and h6["summary"] == "H6 said yes" and "Hotel: Yes" in h6["transcript"]
+        # the email gets the winner's distance, quoted price and transcript
+        import mailer
+        req, win, opts, stats = pl.email_items(run)
+        assert win["name"] == "H6" and win["quoted_night"] == 125 and win["km"] is not None, win
+        assert req["nights"] == 2 and len(opts) == 7 and stats["Hotels phoned"] == 6
+        subject, text, html = mailer.build(req, win, opts, stats)
+        assert "H6" in subject or "Reservation Confirmed" in subject
+        assert "$250.00 CAD" in text and "km from city centre" in text and "Hotel: Yes" in text, text
     finally:
         agent.llm, agent.call_candidate, agent.tts, hs.serp, hs.PLACES_KEY, lite.find_hotels = saved
     print("ok  pipeline: parse, search, batch of 3, next batch when none free, cheapest quote wins")
@@ -582,7 +590,58 @@ async def t_pipeline():
     print("ok  pipeline preflight: empty/dead/5xx tunnel caught before dialing")
 
 
+async def t_mailer():
+    """Format from plain dicts (organizers' subject with TEAM_NUMBER); Resend vs SMTP routing."""
+    import mailer
+
+    req = {"city": "Whitby", "check_in": "2026-10-18", "check_out": "2026-10-20", "nights": 2,
+           "adults": 2, "room_type": "king"}
+    win = {"name": "Quality Suites Whitby", "address": "1700 Champlain Ave, Whitby, ON", "km": 4.66,
+           "phone": "+19054328800", "listed_night": 127, "quoted_night": 119, "fees": "13% HST",
+           "room_type": "King", "reference": "QS4471", "status": "verified",
+           "transcript": "Agent: Do you have a king room?\nHotel: Yes, 119 a night.<script>"}
+    other = {"name": "Spark Oshawa", "km": 5.71, "listed_night": 126, "status": "unavailable",
+             "transcript": [{"role": "user", "content": "We're full."}]}
+    saved = (mailer.TEAM_NUMBER, mailer.RESEND_KEY, mailer.MAIL_FROM, mailer.SMTP_USER,
+             mailer.SMTP_PASS, mailer._smtp)
+    try:
+        mailer.TEAM_NUMBER = "7"
+        subject, text, html = mailer.build(req, win, [win, other], {"Call minutes": 1.2})
+        assert subject == "Team # 7 - Hotel Reservation Confirmed!", subject
+        for want in ("Hotel name: Quality Suites Whitby", "Address: 1700 Champlain Ave", "4.7 km from city centre",
+                     "Reservation #: QS4471", "$119.00 CAD", "Total for the stay: $238.00 CAD",
+                     "Reservation dates: 2026-10-18 to 2026-10-20 (2 nights)", "Hotel: Yes, 119 a night.",
+                     "CALL TRANSCRIPT: Spark Oshawa", "Hotel: We're full.", "No availability"):
+            assert want in text, (want, text)
+        assert "<script>" not in html and "&lt;script&gt;" in html, "transcript must be escaped"
+        assert text.index("Quality Suites Whitby") < text.index("CALL TRANSCRIPT: Spark"), "winner first"
+        mailer.TEAM_NUMBER = ""
+        subject, _, _ = mailer.build(req, None, [other])
+        assert subject == "No hotel could be confirmed in Whitby", subject
+
+        sent = []
+
+        class FakeClient:
+            async def post(self, url, headers, json):
+                sent.append(("resend", json["to"], json["subject"]))
+                return type("R", (), {"raise_for_status": lambda self: None})()
+
+        mailer.RESEND_KEY, mailer.MAIL_FROM, mailer.SMTP_USER, mailer.SMTP_PASS = "re_x", "a@b.c", "", ""
+        await mailer.send("judge@techto.ca", "S", "T", "<p>H</p>", client=FakeClient())
+        mailer.RESEND_KEY, mailer.MAIL_FROM, mailer.SMTP_USER, mailer.SMTP_PASS = "", "", "me@gmail.com", "pw"
+        mailer._smtp = lambda to, s, t, h: sent.append(("smtp", to, s))
+        await mailer.send("judge@techto.ca", "S2", "T", "<p>H</p>")
+        assert sent == [("resend", ["judge@techto.ca"], "S"), ("smtp", "judge@techto.ca", "S2")], sent
+        mailer.SMTP_PASS = ""
+        assert "SMTP_PASS" in mailer.configured()
+    finally:
+        (mailer.TEAM_NUMBER, mailer.RESEND_KEY, mailer.MAIL_FROM, mailer.SMTP_USER,
+         mailer.SMTP_PASS, mailer._smtp) = saved
+    print("ok  mailer: organizers' subject, hotel/price/km/transcripts, escaped html, resend + smtp")
+
+
 async def main():
+    await t_mailer()
     await t_hotel_search()
     await t_pipeline()
     await t_parse()

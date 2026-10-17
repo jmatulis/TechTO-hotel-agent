@@ -33,6 +33,7 @@ details. The agent does not negotiate, and by default it doesn't take payment or
 | `agent.py`         | The whole agent: config, search, ranking, Twilio webhooks, call orchestration, email |
 | `tests/test-agent.py`    | Offline tests; every outside service is faked. **Run after every change.**           |
 | `pipeline.py`      | Prompt → Backboard parse → SerpApi + LiteAPI in parallel → `merge` + `rank` → call best `CALL_BATCH` → Backboard reads transcripts into `CallQuery` → `ranker.cheapest` (confirmed rooms only); next batch if none |
+| `mailer.py`        | The email: `build(req, winner, options, stats)` → subject/text/html (hotel, address, km from centre, quoted vs listed price, every option, transcripts); `send()` via Resend or Gmail SMTP |
 | `hotel_search.py`  | SerpApi Google Hotels: cheapest rates, distance from centre, phones. CLI, `search()` (dicts) or `find_hotels()` (`Hotel` objects) |
 | `liteapi_search.py`| LiteAPI rates + Google Places phones/reviews → `find_hotels()` returns `Hotel` objects |
 | `schemas.py`       | pydantic models: `HotelQuery`, `Hotel`, `CallQuery` (transcript, summary, quoted price, available), `RankWeights` |
@@ -114,7 +115,7 @@ redial), `unreachable`, `timeout`, `cancelled` (a better option won), `no_phone`
 `ELEVEN_API_KEY`, `ELEVEN_VOICE_ID` (default `NOpBlnGInO9m6vDvFkFC`, Spuds Oxley),
 `ELEVEN_MODEL` (default `eleven_flash_v2_5`), `ELEVEN_FORMAT`, `ELEVEN_MODE`, `ELEVEN_TIMEOUT`,
 `ELEVEN_SPEED` (default 1.2), `ELEVEN_STABILITY`, `ELEVEN_SIMILARITY`,
-`RESEND_API_KEY`, `MAIL_FROM`, `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`.
+`TEAM_NUMBER` (email subject `Team # N - Hotel Reservation Confirmed!`), `RESEND_API_KEY`, `MAIL_FROM`, `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`.
 
 ## Commands
 
