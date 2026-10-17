@@ -285,6 +285,8 @@ async def t_tts():
     assert "<Play>https://tunnel.test/audio/" in xml and "<Say" not in xml, xml
     assert url.endswith(f"/text-to-speech/{agent.EL_VOICE}") and headers["xi-api-key"] == "el-key"
     assert body["model_id"] == agent.EL_MODEL and params["output_format"] == agent.EL_FORMAT
+    # voice_settings must be sent, or a library voice uses its own slow saved speed
+    assert body["voice_settings"]["speed"] == agent.EL_SPEED, body
     assert '<Gather input="speech"' in xml and "/turn?c=" in xml
     assert (agent.RUN.tts_calls, agent.RUN.tts_chars) == (1, len("Do you have a room?"))
 

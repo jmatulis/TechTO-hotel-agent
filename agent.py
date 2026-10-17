@@ -63,7 +63,12 @@ VOICE = E("TTS_VOICE", "Polly.Joanna-Neural")          # fallback only, when Ele
 
 # ElevenLabs TTS (sponsor stack). Raw TTS over HTTP only - never their Agents product.
 EL_KEY = E("ELEVEN_API_KEY", "")
-EL_VOICE = E("ELEVEN_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")   # Rachel; swap for whichever you prefer
+EL_VOICE = E("ELEVEN_VOICE_ID", "NOpBlnGInO9m6vDvFkFC")   # Spuds Oxley; see GET /v1/voices
+# Library voices carry their own (slow) saved settings; sending voice_settings overrides them.
+# speed 1.2 cut the opener from 30.7s to 17.3s of speech = less billed call time per run.
+EL_SPEED = float(E("ELEVEN_SPEED", "1.2"))                # 0.7 - 1.2
+EL_STABILITY = float(E("ELEVEN_STABILITY", "0.5"))
+EL_SIMILARITY = float(E("ELEVEN_SIMILARITY", "0.75"))
 EL_MODEL = E("ELEVEN_MODEL", "eleven_flash_v2_5")         # flash = lowest latency tier
 EL_FORMAT = E("ELEVEN_FORMAT", "mp3_22050_32")            # small file -> Twilio fetches it fast
 EL_MODE = E("ELEVEN_MODE", "all").lower()                 # all | opener | off
@@ -330,7 +335,9 @@ async def tts(text: str) -> str | None:
             f"https://api.elevenlabs.io/v1/text-to-speech/{EL_VOICE}",
             headers={"xi-api-key": EL_KEY},
             params={"output_format": EL_FORMAT},
-            json={"text": text, "model_id": EL_MODEL},
+            json={"text": text, "model_id": EL_MODEL,
+                  "voice_settings": {"speed": EL_SPEED, "stability": EL_STABILITY,
+                                     "similarity_boost": EL_SIMILARITY}},
             timeout=EL_TIMEOUT,
         )
         r.raise_for_status()

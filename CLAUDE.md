@@ -103,8 +103,9 @@ redial), `unreachable`, `timeout`, `cancelled` (a better option won), `no_phone`
 `SERP_GL=ca`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM`, `PHONE_OVERRIDE`, `TOP_K`,
 `HOLD_ON_CALL` (1 = accept a hold or reservation if the hotel offers one), `TTS_VOICE`,
 `SPEECH_TIMEOUT`, `MAX_TURNS`, `CALL_TIMEOUT`, `DIAL_RETRIES`, `GUEST_NAME`, `JUDGE_EMAIL`,
-`ELEVEN_API_KEY`, `ELEVEN_VOICE_ID`, `ELEVEN_MODEL` (default `eleven_flash_v2_5`), `ELEVEN_FORMAT`,
-`ELEVEN_MODE`, `ELEVEN_TIMEOUT`,
+`ELEVEN_API_KEY`, `ELEVEN_VOICE_ID` (default `NOpBlnGInO9m6vDvFkFC`, Spuds Oxley),
+`ELEVEN_MODEL` (default `eleven_flash_v2_5`), `ELEVEN_FORMAT`, `ELEVEN_MODE`, `ELEVEN_TIMEOUT`,
+`ELEVEN_SPEED` (default 1.2), `ELEVEN_STABILITY`, `ELEVEN_SIMILARITY`,
 `RESEND_API_KEY`, `MAIL_FROM`, `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`.
 
 ## Commands
@@ -168,6 +169,12 @@ Test the multi-call flow on your own phone: set `PHONE_OVERRIDE=<cell>`, answer 
   With ElevenLabs on, a stale `PUBLIC_URL` also breaks `<Play>`, so the hotel hears **silence**
   instead of a wrong-but-audible voice. Check the tunnel first when a call goes quiet.
 - `AUDIO` is in-process, so audio only survives for the life of the run - which is all we need.
+- **Voice Library voices carry their own saved settings, and they are slow.** Spuds Oxley read the
+  opener in 30.7s on its defaults vs 17.3s at `speed=1.2` - 1.76x the billed call time for the same
+  words. Always send `voice_settings`; measure speech duration as `bytes * 8 / 32000` at
+  `mp3_22050_32` (constant bitrate) rather than trusting how it sounds.
+- A voice ID from someone else's workspace 404s as `voice_not_found`: it must be added to **your**
+  account from the Voice Library first.
 - **Backboard returns HTTP 200 even when the upstream model fails**: `status: "FAILED"` with the
   error text in `content`, so `raise_for_status()` misses it. `llm()` checks for this and raises.
 - Model IDs must *route*, not just exist in the catalogue. `meta-llama/llama-3.1-8b-instruct` is

@@ -124,7 +124,9 @@ Spend to date: `GET /api/billing/usage/summary`.
 **ElevenLabs TTS** (`POST https://api.elevenlabs.io/v1/text-to-speech/{voice_id}`, header `xi-api-key`)
 
 ```
-?output_format=mp3_22050_32      {"text": "<the line>", "model_id": "eleven_flash_v2_5"}
+?output_format=mp3_22050_32
+{"text": "<the line>", "model_id": "eleven_flash_v2_5",
+ "voice_settings": {"speed": 1.2, "stability": 0.5, "similarity_boost": 0.75}}
 ```
 
 Returns raw MP3, cached in `AUDIO` under a hash of the text and served by `GET /audio/{key}` so
