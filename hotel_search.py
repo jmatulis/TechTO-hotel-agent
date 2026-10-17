@@ -14,6 +14,8 @@ parameter, so we query "hotels near <place>" and filter on each property's gps_c
 A place name costs one google_maps search to geocode; "lat,lng" is free. --pages N fetches
 more result pages (~20 hotels each, 1 credit each) so a tight radius still has enough rows.
 """
+from __future__ import annotations
+
 import argparse
 import asyncio
 import json

@@ -1,4 +1,6 @@
 """Offline smoke tests: every outside service is faked. Run: python test-agent.py"""
+from __future__ import annotations
+
 import asyncio
 
 from fastapi.testclient import TestClient

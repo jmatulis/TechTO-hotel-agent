@@ -10,6 +10,8 @@ PHONE_OVERRIDE set, every call rings that one number, one after another.
 
 LLM cost: 1 call to parse + the in-call turns + 1 call per batch to read all its transcripts.
 """
+from __future__ import annotations
+
 import asyncio
 import json
 import os
@@ -232,8 +234,22 @@ def report(run: agent.Run) -> dict:
     }
 
 
+# ---------------------------------------------------------------- preflight
+def preflight(calling: bool = True):
+    """Fail loudly on a missing key instead of a 401 traceback mid-run."""
+    if not hs.SERPAPI_KEY:
+        raise SystemExit("SERPAPI_KEY is empty in .env - no search, no phone numbers.")
+    if not agent.BB_KEY:
+        raise SystemExit("BACKBOARD_API_KEY is empty in .env - cannot parse or read transcripts.")
+    if calling and not (agent.TW_SID and agent.TW_TOKEN and agent.TW_FROM):
+        raise SystemExit("Twilio is not configured (TWILIO_ACCOUNT_SID/AUTH_TOKEN/FROM).")
+    if calling and not agent.PUBLIC_URL:
+        print("[preflight] PUBLIC_URL is empty: no /turn webhooks, calls go nowhere.", file=sys.stderr)
+
+
 async def list_only(prompt: str, top: int = 10):
     """Parse + search + phones, print the table, phone nobody."""
+    preflight(calling=False)
     agent.HTTP = hs.HTTP = httpx.AsyncClient(http2=True, timeout=15)
     agent.RUN = run = agent.Run(prompt)
     try:
@@ -249,6 +265,7 @@ async def list_only(prompt: str, top: int = 10):
 
 
 async def main(prompt: str):
+    preflight()
     agent.HTTP = hs.HTTP = httpx.AsyncClient(http2=True, timeout=15)
     agent.RUN = run = agent.Run(prompt)
     server = uvicorn.Server(uvicorn.Config(agent.app, host="0.0.0.0", port=agent.PORT, log_level="warning"))
