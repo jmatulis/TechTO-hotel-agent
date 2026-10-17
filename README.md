@@ -177,7 +177,7 @@ with "sorry, we're fully booked", then confirm the second one.
 - [ ] SerpApi credits: each run uses about 1 + K lookups (a few more if hotels lack phone numbers)
 - [ ] Tunnel up, and `PUBLIC_URL` matches it
 - [ ] Test receipt lands in the inbox, not spam
-- [ ] One real end-to-end test with `PHONE_OVERRIDE` - listen for the ElevenLabs voice on the
+- [ ] `call_test.py` against your own cell, then one real end-to-end `agent.py` run with `PHONE_OVERRIDE` - listen for the ElevenLabs voice on the
       opener; if you hear Polly instead, `<Play>` failed and it fell back
 - [ ] Ask the organizers: do agents call the real hotels, or a judge-run line? If it's one line,
       set `PHONE_OVERRIDE` to it (calls then go out one at a time so they don't collide)

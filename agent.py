@@ -39,7 +39,11 @@ try:
 except ImportError:
     pass
 
-E = os.environ.get
+def E(key: str, default: str = "") -> str:
+    """os.environ.get, but an empty value in .env falls back to the default rather
+    than shadowing it (an empty GUEST_NAME used to put a hole in the opener)."""
+    return os.environ.get(key) or default
+
 
 # ---------------------------------------------------------------- config
 PUBLIC_URL = E("PUBLIC_URL", "").rstrip("/")          # ngrok / cloudflared URL -> PORT
@@ -117,7 +121,8 @@ class Candidate:
         self.call_status = None
         self.sid = None
         self.attempts = 0
-        self.seconds = 0
+        self.seconds = 0          # from Twilio's /status webhook, when it arrives in time
+        self.local_seconds = 0    # our own dial-to-hangup measure, always available
         self.turns = 0
         self.silent = 0
         self.history: list = []
@@ -125,10 +130,15 @@ class Candidate:
         self.verified_at = None
         self.done = asyncio.Event()
 
+    @property
+    def billed_seconds(self) -> int:
+        """Twilio's own figure when the status callback made it back, else our measure."""
+        return self.seconds or self.local_seconds
+
     def summary(self) -> dict:
         return {"name": self.name, "listed_price": self.price, "phone": self.phone,
                 "status": self.status, "facts": self.facts, "attempts": self.attempts,
-                "call_seconds": self.seconds}
+                "call_seconds": self.billed_seconds}
 
 
 class Run:
@@ -509,13 +519,20 @@ async def call_candidate(run: Run, c: Candidate):
         for attempt in range(DIAL_RETRIES + 1):
             c.done.clear()
             c.call_status = None
+            dialed = time.perf_counter()
             c.sid = await place_call(run, c)
             try:
                 await asyncio.wait_for(c.done.wait(), CALL_TIMEOUT)
             except asyncio.TimeoutError:
                 await hang_up(c.sid)
                 c.status = "timeout"
+                c.local_seconds += int(time.perf_counter() - dialed)
                 return
+            finally:
+                # Twilio's /status callback carries CallDuration but lands a beat after
+                # hangup, often past the end of the run. Keep our own measure so the
+                # cost report is never 0; billed_seconds prefers Twilio's when it arrives.
+                c.local_seconds = max(c.local_seconds, int(time.perf_counter() - dialed))
             if c.status in TERMINAL:
                 return
             if c.call_status not in RETRYABLE:
@@ -606,7 +623,7 @@ def receipt(run: Run) -> tuple[str, str, str]:
         ]
     rows += [("Total agent time (s)", run.marks.get("calls")),
              ("LLM tokens in/out", f"{run.tok_in}/{run.tok_out}"),
-             ("Call minutes", round(sum(c.seconds for c in run.cands) / 60, 2))]
+             ("Call minutes", round(sum(c.billed_seconds for c in run.cands) / 60, 2))]
 
     checked = [c for c in run.cands if c.status not in ("queued",) or c.attempts]
     opt_rows = [(c.name, money(c.facts.get("price") or c.price), STATUS_TEXT.get(c.status, c.status),
@@ -701,7 +718,7 @@ async def main(prompt: str):
             "llm_calls": run.llm_calls, "serpapi_calls": run.serp_calls,
             "tokens": {"in": run.tok_in, "out": run.tok_out},
             "tts": {"calls": run.tts_calls, "chars": run.tts_chars, "cached": len(AUDIO)},
-            "call_seconds": sum(c.seconds for c in run.cands),
+            "call_seconds": sum(c.billed_seconds for c in run.cands),
         }, indent=2, default=str))
         await asyncio.sleep(0.5)  # let Twilio deliver the last status callbacks
         server.should_exit = True

@@ -32,6 +32,7 @@ details. The agent does not negotiate, and by default it doesn't take payment or
 | ------------------ | ------------------------------------------------------------------------------------ |
 | `agent.py`         | The whole agent: config, search, ranking, Twilio webhooks, call orchestration, email |
 | `test-agent.py`    | Offline tests; every outside service is faked. **Run after every change.**           |
+| `call_test.py`     | Dials one invented hotel: real call, no SerpApi, no email. Tune the call here         |
 | `README.md`        | Human-facing blueprint, API payloads, setup, checklist                               |
 | `.env.example`     | All config keys; copy to `.env` (never commit `.env`)                                |
 | `requirements.txt` | httpx[http2], fastapi, uvicorn, python-dotenv, python-multipart                      |
@@ -112,9 +113,10 @@ redial), `unreachable`, `timeout`, `cancelled` (a better option won), `no_phone`
 
 ```bash
 pip install -r requirements.txt
-python test_agent.py                                   # offline tests, no keys needed
+.venv/bin/python test-agent.py                         # offline tests, no keys needed
 cloudflared tunnel --url http://localhost:8080         # or: ngrok http 8080 → PUBLIC_URL
-python agent.py "Find the best hotel deal in Toronto for 2026-10-18 to 2026-10-19, send to judge@x.com"
+.venv/bin/python call_test.py "Good Value Inn" 129      # ONE real call, no search, no email
+.venv/bin/python agent.py "Find the best hotel deal in Toronto for 2026-10-18 to 2026-10-19, send to judge@x.com"
 ```
 
 Test the multi-call flow on your own phone: set `PHONE_OVERRIDE=<cell>`, answer the first call with
@@ -128,7 +130,8 @@ Test the multi-call flow on your own phone: set `PHONE_OVERRIDE=<cell>`, answer 
 - **Never block the event loop**: blocking work goes through `asyncio.to_thread` (like SMTP).
 - A `/turn` handler must always return valid TwiML, even when the LLM fails, so the line never goes dead.
 - The agent says it's an automated assistant, never shares payment details, and never invents facts.
-- Run `python test_agent.py` after every change; add a test for each new behaviour, with
+- Run `.venv/bin/python test-agent.py` after every change (plain `python` is not on PATH, and
+  system `python3` has no fastapi); add a test for each new behaviour, with
   services faked as the existing tests do.
 - Don't print or log API keys or the full `.env`.
 
@@ -169,6 +172,10 @@ Test the multi-call flow on your own phone: set `PHONE_OVERRIDE=<cell>`, answer 
   With ElevenLabs on, a stale `PUBLIC_URL` also breaks `<Play>`, so the hotel hears **silence**
   instead of a wrong-but-audible voice. Check the tunnel first when a call goes quiet.
 - `AUDIO` is in-process, so audio only survives for the life of the run - which is all we need.
+- **Twilio's `/status` callback (with `CallDuration`) lands a beat after hangup**, usually after the
+  run has printed its report, so `c.seconds` stays 0. `call_candidate` measures dial-to-hangup
+  itself into `c.local_seconds`; read totals through `c.billed_seconds`, which prefers Twilio's
+  figure when it arrived. A measured 54s call was reporting 0 before this.
 - **Voice Library voices carry their own saved settings, and they are slow.** Spuds Oxley read the
   opener in 30.7s on its defaults vs 17.3s at `speed=1.2` - 1.76x the billed call time for the same
   words. Always send `voice_settings`; measure speech duration as `bytes * 8 / 32000` at

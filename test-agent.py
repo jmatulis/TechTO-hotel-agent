@@ -20,6 +20,7 @@ REQ = {"city": "Toronto", "check_in": "2026-10-18", "check_out": "2026-10-20", "
 
 
 def fresh():
+    agent.PHONE_OVERRIDE = ""      # tests must not inherit a real .env
     agent.RUN = agent.Run("x")
     agent.RUN.req = dict(REQ)
     agent.RUN.cands = agent.rank(PROPS)
@@ -55,7 +56,7 @@ def t_rank_phone():
 
 
 async def t_shortlist():
-    run = fresh()
+    run = fresh()                  # PHONE_OVERRIDE off: a phone-less hotel must be skipped
     serp_log = []
 
     async def fake_serp(params):
@@ -316,11 +317,37 @@ async def t_tts():
     print("ok  tts: eleven <Play>, cache hit, failure falls back to <Say>, opener-only mode")
 
 
+def t_env():
+    """An empty value in .env must not shadow the code default."""
+    import os
+    os.environ["GUEST_NAME"] = ""
+    assert agent.E("GUEST_NAME", "Jordan Fulawka") == "Jordan Fulawka"
+    os.environ["GUEST_NAME"] = "Someone Else"
+    assert agent.E("GUEST_NAME", "Jordan Fulawka") == "Someone Else"
+    del os.environ["GUEST_NAME"]
+    assert agent.E("GUEST_NAME", "Jordan Fulawka") == "Jordan Fulawka"
+    print("ok  env: empty .env value falls back to the default")
+
+
+def t_billed_seconds():
+    """Cost reporting must survive a /status callback that never arrives."""
+    c = agent.Candidate(0, {"name": "X"}, 100, 100.0)
+    assert c.billed_seconds == 0
+    c.local_seconds = 54                      # our dial-to-hangup measure
+    assert c.billed_seconds == 54, "must fall back to the local measure"
+    c.seconds = 60                            # Twilio's webhook landed in time
+    assert c.billed_seconds == 60, "Twilio's own figure wins when present"
+    assert c.summary()["call_seconds"] == 60
+    print("ok  billed_seconds: Twilio figure preferred, local measure as fallback")
+
+
 async def main():
     await t_parse()
     await t_llm()
     await t_tts()
+    t_env()
     t_rank_phone()
+    t_billed_seconds()
     await t_shortlist()
     await t_verify_parallel()
     await t_verify_sequential()
