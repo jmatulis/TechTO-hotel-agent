@@ -9,6 +9,8 @@ tunnel in PUBLIC_URL and a phone in PHONE_OVERRIDE; everything else comes from .
 
 Answer the phone as a front desk would: "yes, we have a queen at 129 plus tax".
 """
+from __future__ import annotations
+
 import asyncio
 import json
 import sys

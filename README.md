@@ -155,11 +155,56 @@ pre-generated openers; `off` disables it entirely.
 ## Setup
 
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env              # fill in keys
 cloudflared tunnel --url http://localhost:8080   # or: ngrok http 8080 → put URL in PUBLIC_URL
-python test_agent.py              # offline tests, no keys needed
-python agent.py "Find the best hotel deal in Toronto for 2026-10-18 to 2026-10-19, send to judge@x.com"
+.venv/bin/python test-agent.py    # offline tests, no keys needed
+```
+
+## Commands
+
+Run from the repo folder. Anything that phones needs the tunnel up and its URL in `PUBLIC_URL`.
+Any `.env` value can be overridden for one run by prefixing it, e.g.
+`PUBLIC_URL=https://x.trycloudflare.com PHONE_OVERRIDE=+1XXXXXXXXXX .venv/bin/python ...`.
+
+**Tests (free, no keys, no network)**
+```bash
+.venv/bin/python test-agent.py
+```
+
+**Hotel search: prices + phones, no calls** (`hotel_search.py`, SerpApi)
+```bash
+.venv/bin/python hotel_search.py Toronto 2026-10-18                      # 10 cheapest, 1 night, 2 adults (1 credit)
+.venv/bin/python hotel_search.py Toronto 2026-10-18 --phones --top 5     # + phone numbers (+1 credit per hotel)
+.venv/bin/python hotel_search.py "New York" 2026-11-02 --nights 2 --adults 1
+.venv/bin/python hotel_search.py Toronto 2026-10-18 --near "CN Tower" --radius 2     # radius around a place
+.venv/bin/python hotel_search.py Toronto 2026-10-18 --near 43.6426,-79.3871 --radius 1.5 --pages 2
+.venv/bin/python hotel_search.py Halifax 2026-10-18 --fresh              # skip SerpApi's ~1h cache
+.venv/bin/python hotel_search.py Toronto 2026-10-18 --json               # raw rows instead of a table
+.venv/bin/python hotel_search.py -h                                      # all options
+```
+
+**Prompt → list, no calls** (`pipeline.py --list`: Backboard parse, 20 km radius, phones)
+```bash
+.venv/bin/python pipeline.py --list "I'm looking for Whitby, for 2 people, at October 18 to October 19"
+```
+
+**Full pipeline: parse → search → phone the 3 cheapest → read transcripts → cheapest confirmed**
+```bash
+.venv/bin/python pipeline.py "King room in Toronto, Oct 18 to 19, 2 adults, send to judge@x.com"
+PHONE_OVERRIDE=+1XXXXXXXXXX .venv/bin/python pipeline.py "..."   # every call rings your cell, one at a time
+```
+Tuning: `CALL_BATCH` (3 per round), `MAX_ROUNDS` (3), `RADIUS_KM` (20, 0 = off), `SEARCH_PAGES` (1).
+
+**One test call, no search, no email** (`call_test.py`; needs `PHONE_OVERRIDE`)
+```bash
+.venv/bin/python call_test.py                         # "Test Inn" at 129
+.venv/bin/python call_test.py "Good Value Inn" 149    # your own hotel name and nightly rate
+```
+
+**Original single-file agent** (`agent.py`: SerpApi search, parallel calls, first verified wins, email)
+```bash
+.venv/bin/python agent.py "Find the best hotel deal in Toronto for 2026-10-18 to 2026-10-19, send to judge@x.com"
 ```
 
 ## Testing with your own phone
