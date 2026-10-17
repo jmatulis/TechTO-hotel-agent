@@ -185,7 +185,7 @@ def apply(run: agent.Run, c: agent.Candidate, x: dict | None):
     f, q = c.facts, run.req
     wrong_dates = (f.get("check_in") not in (None, q["check_in"])
                    or f.get("check_out") not in (None, q["check_out"]))
-    if c.history:          # only reclassify calls that reached a person
+    if c.history and c.status not in ("voicemail", "ivr"):   # these never reached a person
         c.status = ("verified" if f.get("available") is True and not wrong_dates
                     else "unavailable" if f.get("available") is False or wrong_dates else "unclear")
     if c.status == "verified" and not c.verified_at:
@@ -245,7 +245,8 @@ async def run_pipeline(run: agent.Run) -> agent.Candidate | None:
             break
         print(f"round {rnd}: calling " + ", ".join(f"{c.name} ({c.price:.0f})" for c in batch),
               file=sys.stderr)
-        await asyncio.gather(*(agent.tts(agent.opener(run, c)) for c in batch))   # pre-build openers
+        # pre-build the openers and the fixed lines: no live turn then waits on ElevenLabs
+        await asyncio.gather(*(agent.tts(agent.opener(run, c)) for c in batch), agent.prewarm_lines())
         await call_batch(run, batch)
         facts = await read_calls(run, batch)
         for c in batch:
@@ -267,6 +268,7 @@ def report(run: agent.Run) -> dict:
                    if run.winner else None),
         "called": [{"name": c.name, "listed_night": c.price, "status": c.status, "phone": c.phone,
                     "distance_km": c.km, "summary": c.call.summary if c.call else None,
+                    "answered_by": c.answered_by, "turns": c.turns,
                     "quoted_night": c.facts.get("price"),
                     "quoted_total": c.facts.get("total") or (c.facts.get("price") or 0) * n or None,
                     "room_type": c.facts.get("room_type"), "fees": c.facts.get("fees"),
@@ -274,7 +276,7 @@ def report(run: agent.Run) -> dict:
         "timings_s": run.marks,
         "llm": {"calls": run.llm_calls, "tokens_in": run.tok_in, "tokens_out": run.tok_out},
         "requests": dict(hs.COUNT),
-        "tts": {"calls": run.tts_calls, "chars": run.tts_chars},
+        "tts": {"calls": run.tts_calls, "chars": run.tts_chars, "speech_s": round(run.tts_seconds, 1)},
         "call_seconds": sum(c.billed_seconds for c in run.cands),
     }
 
@@ -311,6 +313,7 @@ def email_items(run: agent.Run) -> tuple[dict, dict | None, list[dict], dict]:
     def item(c: agent.Candidate) -> dict:
         f = c.facts
         return {"name": c.name, "address": c.address, "phone": c.phone, "km": getattr(c, "km", None),
+                "answered_by": c.answered_by,
                 "listed_night": c.price, "quoted_night": f.get("price"), "quoted_total": f.get("total"),
                 "fees": f.get("fees"), "room_type": f.get("room_type"), "cancellation": f.get("cancellation"),
                 "reference": f.get("reference"), "status": c.status, "verified_at": c.verified_at,

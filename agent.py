@@ -79,9 +79,21 @@ EL_MODE = E("ELEVEN_MODE", "all").lower()                 # all | opener | off
 EL_TIMEOUT = float(E("ELEVEN_TIMEOUT", "4"))              # past this we fall back rather than stall the call
 SPEECH_TIMEOUT = E("SPEECH_TIMEOUT", "auto")          # "auto" or seconds, e.g. "1"
 BARGE_IN = E("BARGE_IN", "0") == "1"                  # 1 = the hotel can cut the agent off mid-sentence
-MAX_TURNS = int(E("MAX_TURNS", "6"))
-CALL_TIMEOUT = float(E("CALL_TIMEOUT", "120"))        # per call attempt
-DIAL_RETRIES = int(E("DIAL_RETRIES", "1"))            # redials on busy / no answer
+MAX_TURNS = int(E("MAX_TURNS", "4"))                  # no answer by turn 4 = a dead end, hang up
+MAX_SILENT = int(E("MAX_SILENT", "2"))                # empty <Gather> results before we give up on the line
+ASK_EXTRAS = E("ASK_EXTRAS", "0") == "1"              # 1 = also ask fees + cancellation (~2 more turns)
+FAST_GOODBYE = E("FAST_GOODBYE", "1") == "1"          # close on a pre-synthesized line, not the model's
+CALL_TIMEOUT = float(E("CALL_TIMEOUT", "90"))         # per call attempt, dial included
+TALK_TIMEOUT = float(E("TALK_TIMEOUT", "45"))         # from the hotel's first word to our hangup
+DIAL_TIMEOUT = E("DIAL_TIMEOUT", "15")                # seconds Twilio lets it ring before "no-answer"
+DIAL_RETRIES = int(E("DIAL_RETRIES", "0"))            # 0 = dial the next hotel rather than redial a dead one
+# Answering-machine detection. Twilio calls it a machine when it hears one unbroken stretch of
+# speech longer than the threshold - and a front desk greeting ("Good afternoon, thank you for
+# calling the Riverside Inn, this is Priya, how may I help you?") is long. 3000ms is deliberately
+# above Twilio's 2400 default: lower values start killing real hotels.
+AMD = E("AMD", "1") == "1"
+AMD_TIMEOUT = E("AMD_TIMEOUT", "8")                   # stop deciding human-vs-machine after this
+AMD_SPEECH_MS = E("AMD_SPEECH_MS", "3000")
 RECORD_CALLS = E("RECORD_CALLS", "1") == "1"          # Twilio records each call; the winner's mp3 is emailed
 HOLD_ON_CALL = E("HOLD_ON_CALL", "0") == "1"          # 1 -> accept a hold/reservation if offered
 
@@ -94,8 +106,9 @@ SMTP_USER = E("SMTP_USER", "")
 SMTP_PASS = E("SMTP_PASS", "")                        # Gmail app password
 
 RETRYABLE = {"busy", "no-answer"}
-TERMINAL = {"verified", "unavailable", "unclear", "no_answer", "unreachable",
+TERMINAL = {"verified", "unavailable", "unclear", "no_answer", "voicemail", "ivr", "unreachable",
             "timeout", "no_phone", "cancelled", "error"}
+MACHINE = {"machine_start", "machine_end_beep", "machine_end_silence", "machine_end_other", "fax"}
 FACT_KEYS = ("available", "price", "fees", "room_type", "cancellation", "check_in_time",
              "reference", "staff_name")
 
@@ -130,6 +143,9 @@ class Candidate:
         self.local_seconds = 0    # our own dial-to-hangup measure, always available
         self.turns = 0
         self.silent = 0
+        self.machine = False      # Twilio AMD heard a recording, not a person
+        self.answered_by = None   # AMD's verdict: human / machine_start / fax / unknown
+        self.answered_at = None   # perf_counter at the hotel's first word, for TALK_TIMEOUT
         self.history: list = []
         self.facts: dict = {}
         self.verified_at = None
@@ -143,6 +159,7 @@ class Candidate:
     def summary(self) -> dict:
         return {"name": self.name, "listed_price": self.price, "phone": self.phone,
                 "distance_km": self.km, "status": self.status, "facts": self.facts, "attempts": self.attempts,
+                "answered_by": self.answered_by, "turns": self.turns,
                 "call_seconds": self.billed_seconds}
 
 
@@ -154,6 +171,7 @@ class Run:
         self.winner: Candidate | None = None
         self.tok_in = self.tok_out = self.llm_calls = self.serp_calls = 0
         self.tts_calls = self.tts_chars = 0
+        self.tts_seconds = 0.0    # how long the agent actually talks: most of the billed call time
         self.t0 = time.perf_counter()
         self.marks: dict = {}
 
@@ -325,13 +343,28 @@ async def pick_shortlist(run: Run) -> list[Candidate]:
         # opener text needs only name/price/req, so its audio can be built
         # concurrently with the phone-number lookups - free latency.
         await asyncio.gather(*(enrich(c, run.req) for c in batch),
-                             *(tts(opener(run, c)) for c in batch))
+                             *(tts(opener(run, c)) for c in batch), prewarm_lines())
         short += [c for c in batch if c.status != "no_phone"]
     return short
 
 
 # ---------------------------------------------------------------- step 3: verification calls
 AUDIO: dict[str, bytes] = {}                          # key -> mp3, served from /audio/<key>
+AUDIO_LOCKS: dict[str, asyncio.Lock] = {}             # one synth per line, even across parallel calls
+
+# Lines we know we might say. Pre-synthesized before the first call, so no live turn ever waits on
+# ElevenLabs for them - and three parallel calls needing "Sorry, I didn't catch that" share one mp3.
+REPROMPT = "Sorry, I didn't catch that. Could you say that again?"
+GAVE_UP = "Sorry, I'm having trouble hearing you. Thank you, goodbye."
+GOODBYE = "Thank you, that is all I needed. Goodbye."
+FIXED_LINES = (REPROMPT, GAVE_UP, GOODBYE)
+
+
+def speech_seconds(mp3: bytes) -> float:
+    """Duration straight from the byte count: the ELEVEN_FORMAT we use is constant bitrate, so this
+    is exact and free. Measure the agent's talk time, never trust how fast it sounds."""
+    m = re.search(r"_(\d+)$", EL_FORMAT)
+    return len(mp3) * 8 / (int(m.group(1)) * 1000) if m else 0.0
 
 
 def _akey(text: str) -> str:
@@ -345,6 +378,13 @@ async def tts(text: str) -> str | None:
     key = _akey(text)
     if key in AUDIO:                                   # repeated lines cost nothing
         return key
+    async with AUDIO_LOCKS.setdefault(key, asyncio.Lock()):
+        if key in AUDIO:      # a parallel call (or the pre-warm) synthesized it while we waited
+            return key
+        return await _synth(text, key)
+
+
+async def _synth(text: str, key: str) -> str | None:
     try:
         r = await HTTP.post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{EL_VOICE}",
@@ -362,7 +402,16 @@ async def tts(text: str) -> str | None:
     AUDIO[key] = r.content
     RUN.tts_calls += 1
     RUN.tts_chars += len(text)
+    RUN.tts_seconds += speech_seconds(r.content)
     return key
+
+
+async def prewarm_lines():
+    """Synthesize the fixed lines up front. Cheap (three short lines, once per run) and it takes
+    an ElevenLabs round trip off the critical path of a live turn, including the hangup."""
+    if not (EL_KEY and PUBLIC_URL) or EL_MODE == "off":
+        return
+    await asyncio.gather(*(tts(t) for t in FIXED_LINES), return_exceptions=True)
 
 
 async def voice_el(text: str) -> str:
@@ -404,18 +453,20 @@ def nights(q: dict) -> int:
 
 
 def opener(run: Run, c: Candidate) -> str:
-    """One question, as short as possible. With BARGE_IN=0 this plays uninterrupted, so
-    every extra clause is dead air a real front desk has to sit through. The nights, the
-    exact rate and the cancellation policy are what the follow-up turns are for."""
+    """As short as the two facts allow. With BARGE_IN=0 this plays uninterrupted, so every extra
+    clause is dead air a real front desk sits through - on every call, dead ends included. Asking
+    the rate here rather than on a second turn saves a whole exchange (~15s) when they answer both
+    at once, which a front desk usually does."""
     q, n = run.req, nights(run.req)
     when = f"{date.fromisoformat(q['check_in']):%B %-d}"
     stay = when if n == 1 else f"{n} nights from {when}"
     room = f"{q['room_type']} room" if q.get("room_type") else "room"
-    return (
-        f"Hi, this is an automated assistant calling for {GUEST_NAME}. Do you have a {room} "
-        f"available {stay} for {q['adults']} guest{'s' * (q['adults'] > 1)}, "
-        f"around {c.price:.0f} a night?"
-    )
+    guests = f"{q['adults']} guest{'s' * (q['adults'] > 1)}"
+    if ASK_EXTRAS:
+        return (f"Hi, this is an automated assistant calling for {GUEST_NAME}. Do you have a {room} "
+                f"available {stay} for {guests}, around {c.price:.0f} a night?")
+    return (f"Hi, I'm an automated assistant calling for {GUEST_NAME}. Do you have a {room} "
+            f"for {stay}, {guests}? And the nightly rate?")
 
 
 def system_prompt(run: Run, c: Candidate) -> str:
@@ -427,15 +478,45 @@ def system_prompt(run: Run, c: Candidate) -> str:
         f"You are an automated assistant on a live phone call with {c.name}, verifying a hotel room "
         f"for {GUEST_NAME}: {q['check_in']} to {q['check_out']}, {q['adults']} adult(s)"
         f"{', room type: ' + q['room_type'] if q.get('room_type') else ''}. "
-        f"Listed online at {c.price:.0f} {CURRENCY}/night. Confirm, one short question at a time: "
-        "is a room available for those dates, the nightly rate, taxes or fees, and the cancellation policy. "
+        f"Listed online at {c.price:.0f} {CURRENCY}/night. " + (
+            "Confirm, one short question at a time: is a room available for those dates, the "
+            "nightly rate, taxes or fees, and the cancellation policy. " if ASK_EXTRAS else
+            "You need exactly two facts: is a room available for those dates, and the nightly rate. "
+            "Ask for nothing else - take fees, cancellation or a reference only if volunteered. ") +
         f"{hold}Never share payment details. Never invent facts. "
         'Reply ONLY JSON: {"say":str (<=25 words, natural speech),"done":bool,"available":bool|null,'
         '"price":number|null,"fees":str|null,"room_type":str|null,"cancellation":str|null,'
         '"check_in_time":str|null,"reference":str|null,"staff_name":str|null}. '
-        "Set done=true and say thanks and goodbye once availability and price are known, "
-        "or as soon as they say nothing is available."
+        "Set done=true and say thanks and goodbye once availability and price are known, or as soon "
+        "as they say nothing is available. Never ask a question you already have the answer to."
     )
+
+
+# A recording or a phone tree, spotted in the transcript itself: free, instant, and it catches what
+# AMD cannot (a menu is speech, so AMD may well call it human). Twilio's STT gives us this text
+# anyway, so the check costs nothing and saves the LLM call for that turn.
+VOICEMAIL_RE = re.compile(
+    r"leave (a|your) (message|name|number)|after the (beep|tone)|at the tone|voice ?mail|"
+    r"record your message|mailbox is|no longer in service|has been disconnected|"
+    r"not available (right now|at the moment)", re.I)
+IVR_RE = re.compile(
+    r"press (one|two|three|four|five|six|seven|eight|nine|zero|\d)|"
+    r"for (reservations|the front desk|guest services|english|french|spanish)[,.]? *(please )?press|"
+    r"(main|our) menu|dial (your party's )?extension|"
+    r"(we are|we're|our (office|front desk)s? (is|are)) currently closed|"
+    r"outside (our|of) (normal )?(business|office) hours", re.I)
+
+
+def dead_end(c: Candidate, heard: str) -> str | None:
+    """`voicemail`, `ivr`, or None. Only in the opening exchanges: later on the same words are
+    ordinary conversation ("would you like to leave a message for the manager?")."""
+    if c.turns > 2:
+        return None
+    if VOICEMAIL_RE.search(heard):
+        return "voicemail"
+    if IVR_RE.search(heard):
+        return "ivr"
+    return None
 
 
 def finish(c: Candidate):
@@ -462,32 +543,77 @@ async def turn(request: Request):
     form = await request.form()
     heard = (form.get("SpeechResult") or "").strip()
     c.turns += 1
+    if c.answered_at is None:
+        c.answered_at = time.perf_counter()
 
     if not heard:
-        c.silent += 1
-        if c.silent >= 2:
+        if c.machine:                       # AMD already said recording: don't talk to it
+            c.status = "voicemail"
             finish(c)
-            return xml(await hangup_twiml("Sorry, I'm having trouble hearing you. Thank you, goodbye."))
-        return xml(await gather(c, "Sorry, I didn't catch that. Could you say that again?"))
+            return xml("<Response><Hangup/></Response>")
+        c.silent += 1
+        if c.silent >= MAX_SILENT:
+            finish(c)
+            c.history.append({"role": "assistant", "content": GAVE_UP})
+            return xml(await hangup_twiml(GAVE_UP))
+        return xml(await gather(c, REPROMPT))
 
     c.silent = 0
+    if dead := dead_end(c, heard):
+        c.history.append({"role": "user", "content": heard})
+        c.status = dead                     # terminal, so finish() keeps it
+        finish(c)
+        print(f"[{dead}] {c.name}: {heard[:70]!r}", file=sys.stderr)
+        return xml("<Response><Hangup/></Response>")   # never read a line to a recording
+
     c.history.append({"role": "user", "content": heard})
+    if time.perf_counter() - c.answered_at > TALK_TIMEOUT:
+        finish(c)                           # going nowhere: close on the facts we have
+        c.history.append({"role": "assistant", "content": GOODBYE})
+        print(f"[talk-timeout] {c.name} after {c.turns} turns", file=sys.stderr)
+        return xml(await hangup_twiml(GOODBYE))
+
     try:
         out = await llm([{"role": "system", "content": system_prompt(RUN, c)}] + c.history[-6:])
     except Exception as e:  # never leave the line dead
         print(f"[llm] {c.name}: {e!r}", file=sys.stderr)
         out = {"say": "Sorry, could you repeat that?", "done": False}
 
-    say = out.get("say") or "Thank you."
-    c.history.append({"role": "assistant", "content": say})
     for k in FACT_KEYS:
         if out.get(k) is not None:
             c.facts[k] = out[k]
 
-    if out.get("done") or c.facts.get("available") is False or c.turns >= MAX_TURNS:
+    say = out.get("say") or "Thank you."
+    ending = bool(out.get("done")) or c.facts.get("available") is False or c.turns >= MAX_TURNS
+    if ending and FAST_GOODBYE:
+        say = GOODBYE                       # pre-synthesized: the hangup costs no round trip
+    c.history.append({"role": "assistant", "content": say})
+    if ending:
         finish(c)
         return xml(await hangup_twiml(say))
     return xml(await gather(c, say))
+
+
+@app.post("/amd")
+async def amd(request: Request):
+    """Twilio's answering-machine verdict. `AsyncAmd` runs the detection alongside the call - the
+    opener plays immediately and this lands a few seconds in - so a human answer waits for nothing.
+    A recording or a phone tree is a dead end the agent cannot navigate, so hang up at once and let
+    the run move on to the next hotel instead of spending the turn budget on it."""
+    c = _cand(request)
+    if c is None:
+        return Response(status_code=204)
+    form = await request.form()
+    c.answered_by = form.get("AnsweredBy") or "unknown"
+    if c.answered_by in MACHINE:
+        c.machine = True
+        if c.status not in TERMINAL:
+            c.status = "voicemail"
+        # The verdict can beat our own create-call response, so c.sid may still be unset.
+        await hang_up(c.sid or form.get("CallSid"))
+        c.done.set()
+        print(f"[amd] {c.name}: {c.answered_by}, hung up", file=sys.stderr)
+    return Response(status_code=204)
 
 
 @app.post("/status")
@@ -511,7 +637,12 @@ async def place_call(run: Run, c: Candidate) -> str:
         data={"To": PHONE_OVERRIDE or c.phone, "From": TW_FROM,
               "Twiml": await gather(c, opener(run, c)),   # inline: no webhook hop before speaking
               "StatusCallback": f"{PUBLIC_URL}/status?c={c.idx}",
-              "StatusCallbackEvent": "completed", "Timeout": "20",
+              "StatusCallbackEvent": "completed", "Timeout": DIAL_TIMEOUT,
+              **({"MachineDetection": "Enable", "AsyncAmd": "true",
+                  "AsyncAmdStatusCallback": f"{PUBLIC_URL}/amd?c={c.idx}",
+                  "AsyncAmdStatusCallbackMethod": "POST",
+                  "MachineDetectionTimeout": AMD_TIMEOUT,
+                  "MachineDetectionSpeechThreshold": AMD_SPEECH_MS} if AMD else {}),
               **({"Record": "true"} if RECORD_CALLS else {})},
     )
     r.raise_for_status()
@@ -624,6 +755,7 @@ async def verify_all(run: Run, short: list[Candidate]):
 # ---------------------------------------------------------------- step 4: confirmation email
 STATUS_TEXT = {"verified": "Verified available", "unavailable": "No availability",
                "unclear": "Could not confirm", "no_answer": "No answer / busy",
+               "voicemail": "Voicemail / recording", "ivr": "Automated phone menu",
                "unreachable": "Call failed", "timeout": "Call timed out", "no_phone": "No phone listed",
                "cancelled": "Not needed (better option verified)", "error": "Error",
                "queued": "Not called", "calling": "Not called"}
@@ -719,6 +851,8 @@ async def send_receipt(run: Run):
 # ---------------------------------------------------------------- orchestrator
 async def warm():
     urls = ["https://serpapi.com/", f"{BB_BASE}/models/providers", "https://api.twilio.com/"]
+    if EL_KEY and EL_MODE != "off":
+        urls.append("https://api.elevenlabs.io/v1/models")
     if RESEND_KEY:
         urls.append("https://api.resend.com/")
     await asyncio.gather(*(HTTP.head(u, timeout=5) for u in urls), return_exceptions=True)
@@ -761,7 +895,8 @@ async def main(prompt: str):
             "timings_s": run.marks,
             "llm_calls": run.llm_calls, "serpapi_calls": run.serp_calls,
             "tokens": {"in": run.tok_in, "out": run.tok_out},
-            "tts": {"calls": run.tts_calls, "chars": run.tts_chars, "cached": len(AUDIO)},
+            "tts": {"calls": run.tts_calls, "chars": run.tts_chars, "cached": len(AUDIO),
+                    "speech_s": round(run.tts_seconds, 1)},
             "call_seconds": sum(c.billed_seconds for c in run.cands),
         }, indent=2, default=str))
         await asyncio.sleep(0.5)  # let Twilio deliver the last status callbacks

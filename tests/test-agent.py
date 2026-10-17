@@ -162,6 +162,200 @@ async def t_call_cancel_hangs_up():
     print("ok  call lifecycle: cancel hangs up the line; busy -> redial -> no_answer")
 
 
+async def t_amd():
+    """Twilio async AMD: a machine verdict hangs the call up at once and marks it terminal, so the
+    run moves on; a human verdict changes nothing. The verdict can arrive before our own
+    create-call response, so the SID is taken from the callback when we don't have it yet."""
+    posted, dials = [], []
+
+    class FakeHTTP:
+        async def post(self, url, auth=None, data=None):
+            posted.append((url.rsplit("/", 2)[-1], (data or {}).get("Status")))
+            if url.endswith("Calls.json"):
+                dials.append(data)
+            return FakeResp({"sid": "CA1"})
+
+    async def no_tts(text):
+        return None
+
+    saved = (agent.HTTP, agent.tts, agent.AMD)
+    try:
+        agent.HTTP, agent.tts, agent.AMD = FakeHTTP(), no_tts, True
+        run = fresh()
+        cl = TestClient(agent.app)
+
+        c = run.cands[0]
+        c.sid = "CAmachine"
+        r = cl.post(f"/turn?c={c.idx}", data={})          # one unheard turn, no AMD verdict yet
+        assert "<Gather" in r.text, "a silence alone is not a dead end"
+        r = cl.post(f"/amd?c={c.idx}", data={"AnsweredBy": "machine_start", "CallSid": "CAmachine"})
+        assert r.status_code == 204 and c.status == "voicemail" and c.machine is True
+        assert c.answered_by == "machine_start" and c.status in agent.TERMINAL
+        assert c.done.is_set(), "call_candidate must stop waiting on this call"
+        assert posted == [("CAmachine.json", "completed")], posted
+
+        # a person is left completely alone
+        h = run.cands[1]
+        cl.post(f"/amd?c={h.idx}", data={"AnsweredBy": "human", "CallSid": "CAhuman"})
+        assert (h.machine, h.answered_by, h.status) == (False, "human", "queued") and len(posted) == 1
+        # so is an undecided one
+        cl.post(f"/amd?c={h.idx}", data={"AnsweredBy": "unknown"})
+        assert h.status == "queued" and len(posted) == 1
+
+        # verdict beats our create-call response: hang up on the SID Twilio just gave us
+        n = run.cands[2]
+        assert n.sid is None
+        cl.post(f"/amd?c={n.idx}", data={"AnsweredBy": "fax", "CallSid": "CAfax"})
+        assert n.status == "voicemail" and posted[-1] == ("CAfax.json", "completed"), posted
+
+        # AMD said machine: the next unheard turn hangs up silently instead of reading a line
+        # out to a recording
+        m = run.cands[3]
+        m.machine = True
+        body = cl.post(f"/turn?c={m.idx}", data={}).text
+        assert body == "<Response><Hangup/></Response>" and m.status == "voicemail", body
+
+        # the dial itself: short ring-out, async AMD attached, generous speech threshold
+        await agent.place_call(run, run.cands[0])
+        d = dials[-1]
+        assert d["AsyncAmd"] == "true" and d["MachineDetection"] == "Enable"
+        assert "/amd?c=0" in d["AsyncAmdStatusCallback"] and d["AsyncAmdStatusCallbackMethod"] == "POST"
+        assert int(d["MachineDetectionTimeout"]) <= 10, "decide quickly or not at all"
+        # a chatty front-desk greeting is one long stretch of speech: below ~2400ms AMD starts
+        # calling real hotels machines
+        assert int(d["MachineDetectionSpeechThreshold"]) >= 2400, d
+        assert int(d["Timeout"]) <= 20, "ring-out, then the run moves on"
+        agent.AMD = False
+        await agent.place_call(run, run.cands[0])
+        assert "AsyncAmd" not in dials[-1], "AMD=0 turns it off cleanly"
+    finally:
+        agent.HTTP, agent.tts, agent.AMD = saved
+    print("ok  amd: machine hangs up + terminal, human untouched, sid from the callback")
+
+
+async def t_dead_ends():
+    """Voicemail and phone menus spotted in the transcript: hung up on the spot, without an LLM
+    call and without speaking, plus the per-call budgets (TALK_TIMEOUT, MAX_TURNS, fast goodbye)."""
+    saved = (agent.llm, agent.tts, agent.TALK_TIMEOUT, agent.MAX_TURNS, agent.FAST_GOODBYE)
+    calls = []
+
+    async def fake_llm(m):
+        calls.append(m)
+        return {"say": "Great, and the rate?", "done": False, "available": True}
+
+    async def no_tts(text):
+        return None
+    try:
+        agent.llm, agent.tts, agent.FAST_GOODBYE = fake_llm, no_tts, True
+        run = fresh()
+        cl = TestClient(agent.app)
+
+        # what the regexes must and must not catch
+        c = run.cands[0]
+        for heard, want in [
+            ("Please leave a message after the beep.", "voicemail"),
+            ("Your call has been forwarded to voicemail.", "voicemail"),
+            ("The number you have dialed is no longer in service.", "voicemail"),
+            ("For reservations, press one. For the front desk, press two.", "ivr"),
+            ("Thank you for calling. Please listen to our menu.", "ivr"),
+            ("We are currently closed. Our hours are nine to five.", "ivr"),
+            ("Good afternoon, Riverside Inn, this is Priya, how can I help you?", None),
+            ("Yes, we have a queen available, one twenty-nine a night.", None),
+            ("One moment please, let me check that for you.", None),
+            ("Sorry, we're fully booked that night.", None),
+        ]:
+            c.turns = 1
+            assert agent.dead_end(c, heard) == want, (heard, agent.dead_end(c, heard))
+        c.turns = 3                                   # mid-conversation these are just words
+        assert agent.dead_end(c, "Would you like to leave a message for the manager?") is None
+        c.turns = 0
+
+        # a recording on the line: silent hangup, terminal status, no tokens spent
+        v = run.cands[0]
+        body = cl.post(f"/turn?c={v.idx}", data={
+            "SpeechResult": "Thank you for calling. No one is available right now, please leave a "
+                            "message after the tone."}).text
+        assert body == "<Response><Hangup/></Response>" and v.status == "voicemail", body
+        assert calls == [], "a recording must not cost an LLM call"
+        assert "message after the tone" in v.history[0]["content"], "kept for the transcript"
+
+        # a phone menu: same treatment, its own status
+        i = run.cands[1]
+        body = cl.post(f"/turn?c={i.idx}", data={
+            "SpeechResult": "For reservations press one, for the front desk press zero."}).text
+        assert body == "<Response><Hangup/></Response>" and i.status == "ivr" and calls == []
+
+        # fast goodbye: the closing line is the pre-synthesized one, and the transcript says so
+        g = run.cands[2]
+        async def _done():
+            return {"say": "Wonderful, thank you so much for checking all of that for me. Goodbye!",
+                    "done": True, "available": True, "price": 120}
+        agent.llm = lambda m: _done()
+        body = cl.post(f"/turn?c={g.idx}", data={"SpeechResult": "Yes, 120 a night."}).text
+        assert "<Hangup/>" in body and g.status == "verified" and g.facts["price"] == 120
+        assert g.history[-1]["content"] == agent.GOODBYE, g.history[-1]
+        assert agent.GOODBYE in agent.FIXED_LINES, "so it is already synthesized"
+
+        # TALK_TIMEOUT: a call that is going nowhere is closed at the next turn boundary
+        agent.llm, agent.TALK_TIMEOUT = fake_llm, 0.0
+        t = run.cands[3]
+        t.answered_at = None
+        cl.post(f"/turn?c={t.idx}", data={"SpeechResult": "One moment."})      # starts the clock
+        before = len(calls)
+        body = cl.post(f"/turn?c={t.idx}", data={"SpeechResult": "Still looking."}).text
+        assert "<Hangup/>" in body and t.status in agent.TERMINAL, body
+        assert len(calls) == before, "past the deadline we don't pay for another turn"
+
+        # MAX_TURNS: the hard cap on a call that keeps talking
+        agent.TALK_TIMEOUT, agent.MAX_TURNS = 45.0, 2
+        k = run.cands[4]
+        k.answered_at = None
+        assert "<Gather" in cl.post(f"/turn?c={k.idx}", data={"SpeechResult": "Hello?"}).text
+        assert "<Hangup/>" in cl.post(f"/turn?c={k.idx}", data={"SpeechResult": "Hello?"}).text
+        assert k.turns == 2 and k.status in agent.TERMINAL
+    finally:
+        agent.llm, agent.tts, agent.TALK_TIMEOUT, agent.MAX_TURNS, agent.FAST_GOODBYE = saved
+    print("ok  dead ends: voicemail + menu hung up untalked-to, talk/turn budgets enforced")
+
+
+async def t_prewarm():
+    """The fixed lines are synthesized once, up front, and parallel calls needing the same line
+    share one ElevenLabs request instead of each paying for it."""
+    posts = []
+
+    class FakeHTTP:
+        async def post(self, url, headers=None, params=None, json=None, timeout=None):
+            posts.append(json["text"])
+            await asyncio.sleep(0.02)              # long enough for a racing caller to pile up
+            return FakeResp(None, content=b"\x00" * 4000)   # 1.0s at mp3_..._32
+
+    saved = (agent.HTTP, agent.EL_KEY, agent.PUBLIC_URL, agent.EL_MODE, dict(agent.AUDIO))
+    try:
+        agent.HTTP, agent.EL_KEY, agent.PUBLIC_URL, agent.EL_MODE = (
+            FakeHTTP(), "k", "https://x.example", "all")
+        agent.AUDIO.clear()
+        agent.AUDIO_LOCKS.clear()
+        agent.RUN = run = agent.Run("x")
+        await agent.prewarm_lines()
+        assert sorted(posts) == sorted(agent.FIXED_LINES) and len(agent.AUDIO) == 3, posts
+        assert abs(run.tts_seconds - 3.0) < 0.01, run.tts_seconds   # measured from the bytes
+
+        # a live turn now pays nothing for them
+        n = len(posts)
+        assert await agent.tts(agent.REPROMPT) is not None and len(posts) == n
+
+        # three parallel calls hitting the same new line: one request, not three
+        await asyncio.gather(*(agent.tts("a brand new line") for _ in range(3)))
+        assert len(posts) == n + 1, posts
+        assert agent.speech_seconds(b"\x00" * 32000) == 8.0
+    finally:
+        agent.HTTP, agent.EL_KEY, agent.PUBLIC_URL, agent.EL_MODE, audio = saved
+        agent.AUDIO.clear()
+        agent.AUDIO.update(audio)
+        agent.AUDIO_LOCKS.clear()
+    print("ok  prewarm: fixed lines synthesized once up front, parallel calls share one request")
+
+
 async def t_webhook_and_email():
     run = fresh()
     short = run.cands[:3]
@@ -792,6 +986,9 @@ async def t_recording():
 
 
 async def main():
+    await t_amd()
+    await t_dead_ends()
+    await t_prewarm()
     await t_recording()
     await t_prompt_email()
     await t_mailer()

@@ -71,6 +71,16 @@ of the same loop so Twilio can call back into it through a public tunnel.
      quality against per-turn latency; `ELEVEN_TIMEOUT` bounds the stall before falling back.
    - `?c=<idx>` on `/turn` and `/status` identifies which hotel's call a webhook belongs to
      (`run.cands[idx]`). Each `Candidate` holds its own history, facts and status.
+   - **Dead ends are cut, not waited out.** Twilio **async AMD** (`AsyncAmd=true`,
+     `MachineDetection=Enable`) decides human-vs-machine *while* the call runs and POSTs the verdict
+     to `/amd`, so a human answer waits for nothing; a `machine_*`/`fax` verdict hangs the call up
+     and marks it `voicemail`. `AMD_SPEECH_MS` (3000) is the "one unbroken stretch of speech =
+     machine" threshold - **keep it above Twilio's 2400 default**, or long front-desk greetings get
+     killed as machines. `dead_end()` is the second, free detector: `VOICEMAIL_RE` / `IVR_RE` over
+     the speech Twilio already transcribed, in the first two turns only, which catches the menus AMD
+     calls human. Either way the agent hangs up **without speaking** - reading a line to a recording
+     is pure billed time. `TALK_TIMEOUT` (45s from the hotel's first word) and `MAX_TURNS` (4) cap
+     the rest.
    - **`decide()`**: walk the shortlist in rank order. The first `verified` hotel wins once every
      better-ranked one has finished. The remaining calls are cancelled, and `call_candidate`
      hangs up via the Twilio API (`Status=completed`) on cancellation.
@@ -100,8 +110,28 @@ Fields that aren't null get merged into `c.facts`. `available=false` ends the ca
 
 ### Call statuses
 
-`verified`, `unavailable`, `unclear` (silence, hang-up, turn limit), `no_answer` (busy/no answer after
-redial), `unreachable`, `timeout`, `cancelled` (a better option won), `no_phone`, `error`.
+`verified`, `unavailable`, `unclear` (silence, hang-up, turn limit), `no_answer` (busy/no answer),
+`voicemail` (AMD or the transcript heard a recording), `ivr` (automated phone menu), `unreachable`,
+`timeout`, `cancelled` (a better option won), `no_phone`, `error`.
+`pipeline.apply()` never relabels `voicemail`/`ivr`: those calls reached no one.
+
+### Where call seconds go (measured)
+
+Every spoken word is billed call time, so the call asks for the **two facts that decide the winner**
+and nothing else:
+
+- `ASK_EXTRAS=0` (default): the opener asks availability **and** the nightly rate in one breath and
+  the call ends as soon as both are known - ~2 turns instead of ~4, each turn being STT + LLM +
+  TTS + playback. Fees and cancellation are recorded only if volunteered. `ASK_EXTRAS=1` restores
+  the four-fact script.
+- Openers measured through `speech_seconds()` at `ELEVEN_SPEED=1.2`: the old 127-char opener read
+  for **8.6s**, the current 116-char one for **7.7s**. That is per call, dead ends included.
+- `FIXED_LINES` (reprompt, give-up, goodbye) are synthesized by `prewarm_lines()` before the first
+  dial, so no live turn ever waits on ElevenLabs for them, and `FAST_GOODBYE=1` closes on the
+  pre-synthesized goodbye instead of the model's parting line.
+- `tts()` locks per line, so three parallel calls needing "Sorry, I didn't catch that" make one
+  ElevenLabs request between them.
+- The report's `tts.speech_s` is the run's total talk time, from `bytes * 8 / bitrate`.
 
 ## Config (`.env`)
 
@@ -110,8 +140,9 @@ redial), `unreachable`, `timeout`, `cancelled` (a better option won), `no_phone`
 `SERPAPI_KEY`, `CALL_BATCH` (3), `MAX_ROUNDS` (3), `RADIUS_KM` (20, from city centre), `SEARCH_PAGES` (1), `GOOGLE_PLACES_KEY` (optional), `CURRENCY=CAD`,
 `SERP_GL=ca`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM`, `PHONE_OVERRIDE`, `TOP_K`,
 `RECORD_CALLS` (1 = record every call, attach the winner's mp3 to the email), `HOLD_ON_CALL` (1 = accept a hold or reservation if the hotel offers one), `TTS_VOICE`,
-`SPEECH_TIMEOUT`, `BARGE_IN` (0 = the agent is never interrupted), `MAX_TURNS`, `CALL_TIMEOUT`,
-`DIAL_RETRIES`, `GUEST_NAME`, `JUDGE_EMAIL`,
+`SPEECH_TIMEOUT`, `BARGE_IN` (0 = the agent is never interrupted), `MAX_TURNS` (4), `MAX_SILENT` (2),
+`ASK_EXTRAS` (0), `FAST_GOODBYE` (1), `CALL_TIMEOUT` (90), `TALK_TIMEOUT` (45), `DIAL_TIMEOUT` (15),
+`DIAL_RETRIES` (0), `AMD` (1), `AMD_TIMEOUT` (8), `AMD_SPEECH_MS` (3000), `GUEST_NAME`, `JUDGE_EMAIL`,
 `ELEVEN_API_KEY`, `ELEVEN_VOICE_ID` (default `NOpBlnGInO9m6vDvFkFC`, Spuds Oxley),
 `ELEVEN_MODEL` (default `eleven_flash_v2_5`), `ELEVEN_FORMAT`, `ELEVEN_MODE`, `ELEVEN_TIMEOUT`,
 `ELEVEN_SPEED` (default 1.2), `ELEVEN_STABILITY`, `ELEVEN_SIMILARITY`,
@@ -171,11 +202,10 @@ Test the multi-call flow on your own phone: set `PHONE_OVERRIDE=<cell>`, answer 
 ## Backlog, most valuable first
 
 1. Match the required email format once confirmed (see open question 1).
-2. **Phone menus (IVR):** listen before speaking. Let the LLM return a `press` field → `<Play digits>`.
-   Today the opener plays straight away and can talk over an automated menu.
-3. **Holds:** don't hang up after 2 silences while on hold; wait silently up to ~2 minutes.
-4. **Voicemail:** detect it and end that call early so the agent moves on.
-5. Learnings report: estimated $ cost (Twilio minutes, SerpApi searches, tokens) for the presentation.
+2. **Phone menus (IVR):** `IVR_RE` currently *drops* a hotel that answers with a menu. Navigating
+   one would win those hotels back: let the LLM return a `press` field → `<Play digits>`.
+3. **Holds:** don't hang up after `MAX_SILENT` silences while on hold; wait silently up to ~2 minutes.
+4. Learnings report: estimated $ cost (Twilio minutes, SerpApi searches, tokens) for the presentation.
 
 ## Known gotchas
 
@@ -208,3 +238,8 @@ Test the multi-call flow on your own phone: set `PHONE_OVERRIDE=<cell>`, answer 
   always finishes, at the cost that anything said during the audio is not captured.
 - STT mangles spelled-out reference numbers ("T X 4 4 7 1"); have the agent read them back.
 - `RUN` is global: one run per process, which is all the bake-off needs.
+- **AMD cannot tell a phone menu from voicemail**, and a long human greeting can read as machine.
+  That is why `AMD_SPEECH_MS` is 3000 rather than lower, and why `AMD=0` exists: if hotels start
+  coming back `voicemail` when a person answered, turn it off and rely on `dead_end()` alone.
+- **A dead end must never be spoken to.** Both detectors return bare `<Response><Hangup/></Response>`;
+  an earlier version read "sorry, I'm having trouble hearing you" to answering machines.
