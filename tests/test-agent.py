@@ -1191,7 +1191,146 @@ async def t_hold():
     print("ok  hold: 'hold on' -> wait quietly (no LLM, no turn cost), nudge after silence, prompt pushes one answer")
 
 
+async def t_listen_and_menu():
+    """LISTEN_FIRST: the call opens by listening; the opener plays after their greeting or after
+    FIRST_WAIT s of silence, with no LLM. Phone menus: press the reservations / front desk /
+    operator key (digits or words), listen for the next prompt, re-open once a person answers."""
+    # menu reading, no network
+    assert agent.menu_digit("Thank you for calling. For reservations, press 1. For the front desk, press 2.") == "1"
+    assert agent.menu_digit("Press 3 for billing. Press 2 for the front desk.") == "2"
+    assert agent.menu_digit("For sales press two, to speak to an operator press zero") == "0"
+    assert agent.menu_digit("For billing, press 3.") is None
+    assert agent.is_machine("Para español, oprima dos") and agent.is_machine("press 1 for reservations")
+    assert not agent.is_machine("Thank you for calling Holiday Inn, this is Sarah, how can I help?")
+
+    run = fresh()
+    c = run.cands[0]
+    llm_calls, sent = [], []
+
+    async def fake_llm(m):
+        llm_calls.append(m[-1]["content"])
+        return {"say": "", "press": "2", "done": False}       # an LLM-spotted menu
+
+    async def no_tts(text):
+        return None
+
+    class FakeHTTP:
+        async def post(self, url, auth=None, data=None):
+            sent.append(data)
+            return type("R", (), {"raise_for_status": lambda s: None, "json": lambda s: {"sid": "CA1"}})()
+
+    saved = (agent.llm, agent.tts, agent.HTTP, agent.LISTEN_FIRST)
+    try:
+        agent.llm, agent.tts, agent.HTTP = fake_llm, no_tts, FakeHTTP()
+        cl = TestClient(agent.app)
+        op = agent.opener(run, c)
+
+        agent.LISTEN_FIRST = False                            # old behaviour: opener at once
+        await agent.place_call(run, c)
+        assert op in sent[-1]["Twiml"] and c.opened
+
+        agent.LISTEN_FIRST = True                             # new default: listen first
+        await agent.place_call(run, c)
+        tw = sent[-1]["Twiml"]
+        assert "<Say" not in tw and "<Play" not in tw and not c.opened, tw
+        assert f'timeout="{agent.FIRST_WAIT}"' in tw and f'speechTimeout="{agent.FIRST_SPEECH_TIMEOUT}"' in tw
+        r = cl.post(f"/turn?c={c.idx}", data={"SpeechResult": "Good afternoon, Good Value Inn, how can I help?"})
+        assert op in r.text and c.opened and c.turns == 0 and not llm_calls, r.text
+        assert c.history[0]["content"].startswith("Good afternoon") and c.history[1]["content"] == op
+        import pipeline as pl
+        assert pl.transcript(run, c).split("\n")[:2] == ["Hotel: Good afternoon, Good Value Inn, how can I help?",
+                                                       f"Agent: {op}"], "greeting first, opener once"
+
+        c2 = run.cands[1]                                     # silent answer: opener after FIRST_WAIT
+        await agent.place_call(run, c2)
+        r = cl.post(f"/turn?c={c2.idx}", data={})
+        assert agent.opener(run, c2) in r.text and c2.silent == 0 and not llm_calls
+
+        c3 = run.cands[2]                                     # phone tree
+        await agent.place_call(run, c3)
+        r = cl.post(f"/turn?c={c3.idx}", data={"SpeechResult": "Your call is important to us. Please listen carefully."})
+        assert "<Play digits" not in r.text and "<Say" not in r.text and not c3.opened   # keep listening
+        r = cl.post(f"/turn?c={c3.idx}", data={"SpeechResult": "For reservations, press one. For the front desk, press two."})
+        assert '<Play digits="w1"/>' in r.text and c3.presses == 1 and not c3.opened, r.text
+        r = cl.post(f"/turn?c={c3.idx}", data={"SpeechResult": "Reservations, this is Tom."})
+        assert agent.opener(run, c3) in r.text and c3.opened and not llm_calls
+        assert c3.turns == 0, "menu prompts and greetings are not conversation turns"
+
+        r = cl.post(f"/turn?c={c3.idx}", data={"SpeechResult": "Please choose from the following options."})
+        assert '<Play digits="w2"/>' in r.text and llm_calls, "LLM 'press' field as the fallback"
+        assert c3.presses == agent.MAX_PRESSES
+        assert "[pressed 1]" in [m["content"] for m in c3.history]
+        assert '"press":"digit"|null' in agent.system_prompt(run, c3)
+
+        c4 = run.cands[3]                                     # menu with nothing useful: hear it, then 0
+        await agent.place_call(run, c4)
+        for _ in range(agent.MAX_MENU_LISTENS):
+            r = cl.post(f"/turn?c={c4.idx}", data={"SpeechResult": "For billing, press 3."})
+            assert "<Play digits" not in r.text
+        r = cl.post(f"/turn?c={c4.idx}", data={"SpeechResult": "For billing, press 3."})
+        assert '<Play digits="w0"/>' in r.text, r.text
+    finally:
+        agent.llm, agent.tts, agent.HTTP, agent.LISTEN_FIRST = saved
+    print("ok  listen first + phone menus: greet -> opener (no LLM), silence -> opener, press 1/2/0, LLM press fallback")
+
+
+async def t_machine_backup():
+    """Default (LISTEN_FIRST=0): the opener plays at once, as before. Only when a machine is heard
+    does the agent switch: press a menu key, or go quiet and re-open for a person; voicemail ->
+    hang up at once. A normal human call never touches any of it."""
+    assert agent.LISTEN_FIRST is False, "default must be the old speak-first behaviour"
+    for vm in ("You have reached mailbox number 22682 08441, after leaving a message you can hang up",
+               "Please leave a message after the tone", "The person you are calling is not available to take your call"):
+        assert agent.is_voicemail(vm), vm
+    assert not agent.is_voicemail("Yes we have a room at 110")
+
+    run = fresh()
+    llm_calls, sent = [], []
+
+    async def fake_llm(m):
+        llm_calls.append(m[-1]["content"])
+        return {"say": "And the nightly rate?", "done": False, "available": True}
+
+    async def no_tts(text):
+        return None
+
+    class FakeHTTP:
+        async def post(self, url, auth=None, data=None):
+            sent.append(data)
+            return type("R", (), {"raise_for_status": lambda s: None, "json": lambda s: {"sid": "CA1"}})()
+
+    saved = (agent.llm, agent.tts, agent.HTTP)
+    try:
+        agent.llm, agent.tts, agent.HTTP = fake_llm, no_tts, FakeHTTP()
+        cl = TestClient(agent.app)
+
+        c = run.cands[0]                                      # a person answers: exactly as before
+        await agent.place_call(run, c)
+        assert agent.opener(run, c) in sent[-1]["Twiml"] and c.opened
+        r = cl.post(f"/turn?c={c.idx}", data={"SpeechResult": "Yes, we do have rooms."})
+        assert llm_calls == ["Yes, we do have rooms."] and "And the nightly rate?" in r.text and c.turns == 1
+
+        c2 = run.cands[1]                                     # a menu answers, opener already played
+        await agent.place_call(run, c2)
+        r = cl.post(f"/turn?c={c2.idx}", data={"SpeechResult": "Your call is important to us, please stay on the line."})
+        assert "<Say" not in r.text and "<Play" not in r.text and not c2.opened, "quiet: no talking to a tape"
+        r = cl.post(f"/turn?c={c2.idx}", data={"SpeechResult": "For reservations press 1."})
+        assert '<Play digits="w1"/>' in r.text
+        r = cl.post(f"/turn?c={c2.idx}", data={"SpeechResult": "Front desk, this is Ana."})
+        assert agent.opener(run, c2) in r.text and c2.opened and len(llm_calls) == 1, "re-open, no LLM"
+
+        c3 = run.cands[2]                                     # voicemail: hang up, no LLM, next hotel
+        await agent.place_call(run, c3)
+        r = cl.post(f"/turn?c={c3.idx}", data={"SpeechResult": "Please leave a message after the tone."})
+        assert r.text == "<Response><Hangup/></Response>" and c3.status == "no_answer" and len(llm_calls) == 1
+    finally:
+        agent.llm, agent.tts, agent.HTTP = saved
+    print("ok  machine backup: speak-first by default; menu -> press / re-open; voicemail -> hang up")
+
+
 async def main():
+    await t_machine_backup()
+    await t_listen_and_menu()
     await t_hold()
     await t_repeat()
     await t_short_call()

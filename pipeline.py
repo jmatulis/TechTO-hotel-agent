@@ -238,7 +238,10 @@ async def _race(run: agent.Run, batch: list[agent.Candidate], sp) -> agent.Candi
 
 # ---------------------------------------------------------------- 4. read the transcripts
 def transcript(run: agent.Run, c: agent.Candidate) -> str:
-    lines = [f"Agent: {agent.opener(run, c)}"]       # the opener isn't kept in c.history
+    op = agent.opener(run, c)
+    # LISTEN_FIRST records the opener in c.history where it played (after their greeting);
+    # the inline opener of LISTEN_FIRST=0 isn't there, so it goes first.
+    lines = [] if any(m["content"] == op for m in c.history) else [f"Agent: {op}"]
     lines += [f"{'Hotel' if m['role'] == 'user' else 'Agent'}: {m['content']}" for m in c.history]
     return "\n".join(lines)
 

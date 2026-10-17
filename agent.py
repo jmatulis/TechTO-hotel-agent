@@ -94,6 +94,13 @@ BYE = "Perfect, thanks. Goodbye."                     # fixed: its TTS is built 
 WAIT_OK = "Sure, take your time."                     # fixed too: said when they ask us to hold
 HOLD_SECONDS = int(E("HOLD_SECONDS", "15"))           # silence we sit through per check while on hold
 HOLD_CHECKS = int(E("HOLD_CHECKS", "2"))              # silent hold windows before we gently nudge
+LISTEN_FIRST = E("LISTEN_FIRST", "0") == "1"          # 1 = always listen before the opener; 0 = speak at once,
+                                                      # and switch to listening only when a machine is heard
+FIRST_WAIT = int(E("FIRST_WAIT", "2"))                # nobody speaks within this many s -> play the opener anyway
+FIRST_SPEECH_TIMEOUT = E("FIRST_SPEECH_TIMEOUT", "1")  # end of their greeting: 1 s of quiet, not "auto"
+MENU_WAIT = 6                                         # after a key press / during a menu: wait for the next prompt
+MAX_PRESSES = 2                                       # never wander deeper than this into a phone tree
+MAX_MENU_LISTENS = 2                                  # menu with no useful option heard this often -> press 0
 DIAL_RETRIES = int(E("DIAL_RETRIES", "0"))            # redials on busy / no answer; 0 = each hotel is dialed once
 RECORD_CALLS = E("RECORD_CALLS", "1") == "1"          # Twilio records each call; the winner's mp3 is emailed
 HOLD_ON_CALL = E("HOLD_ON_CALL", "0") == "1"          # 1 -> accept a hold/reservation if offered
@@ -124,6 +131,46 @@ WAIT_RE = re.compile(
 
 def wants_wait(heard: str) -> bool:
     return len(heard.split()) <= 10 and bool(WAIT_RE.search(heard))
+
+
+# Phone menus (IVR). STT writes digits either way: "press 1" / "press one".
+_D = r"(\d|zero|one|two|three|four|five|six|seven|eight|nine)"
+DIGITS = {w: str(i) for i, w in enumerate("zero one two three four five six seven eight nine".split())}
+MENU_RE = re.compile(rf"\b(?:press|dial|select)\s+{_D}\s+(?:for|to)\s+([^.,;]+)"
+                     rf"|\b(?:for|to)\s+([^.,;]+?),?\s+(?:please\s+)?(?:press|dial|select)\s+{_D}\b", re.I)
+MACHINE_RE = re.compile(r"\b(press|dial)\s+\S+|para espa|your call is (important|being)|listen carefully|"
+                        r"menu options|options have changed|please (stay on the line|hold while)", re.I)
+# Not "thank you for calling" / "you've reached": real front desks say those too.
+# What we want, best first: someone who can quote a room rate.
+MENU_WANT = (r"reserv|book|availab|\brates?\b|new stay",
+             r"front desk|reception|this hotel|the hotel|guest services|concierge",
+             r"operator|representative|agent|speak (to|with)|all other|other (inquiries|questions)")
+
+
+def menu_digit(heard: str) -> str | None:
+    """The key to press for reservations / front desk / an operator, or None if not offered."""
+    opts = []
+    for m in MENU_RE.finditer(heard):
+        d, label = (m.group(1), m.group(2)) if m.group(1) else (m.group(4), m.group(3))
+        opts.append((DIGITS.get(d.lower(), d), label.lower()))
+    for want in MENU_WANT:
+        for d, label in opts:
+            if re.search(want, label):
+                return d
+    return None
+
+
+def is_machine(heard: str) -> bool:
+    return bool(MACHINE_RE.search(heard))
+
+
+# Voicemail: no key gets a person, so hang up and let the next hotel have the time.
+VOICEMAIL_RE = re.compile(r"leave (a|your) message|after the (tone|beep)|voice ?mail|mailbox|"
+                          r"(not available|unavailable|unable|not able) to (take|answer) (your|the) call|record your message", re.I)
+
+
+def is_voicemail(heard: str) -> bool:
+    return bool(VOICEMAIL_RE.search(heard))
 
 
 def wants_repeat(heard: str) -> bool:
@@ -169,6 +216,9 @@ class Candidate:
         self.repeats = 0          # times we replayed our last line on request
         self.holding = False      # they asked us to wait: silence is expected, not a failure
         self.waits = 0            # silent hold windows so far
+        self.opened = True        # opener played yet? first_twiml() sets False under LISTEN_FIRST
+        self.presses = 0          # phone-menu keys pressed this call
+        self.menu_listens = 0     # menu prompts heard with no useful option
         self.history: list = []
         self.facts: dict = {}
         self.verified_at = None
@@ -436,17 +486,29 @@ async def audio(key: str):
     return Response(content=AUDIO.get(key, b""), media_type="audio/mpeg")
 
 
-async def gather(c: Candidate, say: str, wait: int | None = None) -> str:
+async def gather(c: Candidate, say: str, wait: int | None = None, speech_timeout: str | None = None,
+                 pre: str = "") -> str:
     """Twilio has no bargeIn attribute, so placement is the control: audio nested inside
     <Gather> is cut off by the first sound the hotel makes, audio before <Gather> always
     finishes and the Gather then only listens."""
     g = (f'<Gather input="speech" action="{PUBLIC_URL}/turn?c={c.idx}" method="POST" '
-         f'speechTimeout="{SPEECH_TIMEOUT}" speechModel="phone_call" enhanced="true" '
+         f'speechTimeout="{speech_timeout or SPEECH_TIMEOUT}" speechModel="phone_call" enhanced="true" '
          f'actionOnEmptyResult="true" language="en-US"'
          + (f' timeout="{wait}"' if wait else "") + ">")    # timeout: seconds to wait for speech to start
     v = await voice_el(say) if say else ""
     body = f"{g}{v}</Gather>" if BARGE_IN else f"{v}{g}</Gather>"
-    return f"<Response>{body}</Response>"
+    return f"<Response>{pre}{body}</Response>"
+
+
+async def press(c: Candidate, digit: str) -> str:
+    """Send a phone-menu key, then listen for whatever answers next (another prompt or a person).
+    The opener is replayed once a person greets us: the first one went to a machine."""
+    c.presses += 1
+    c.opened = False
+    c.menu_listens = 0
+    c.history.append({"role": "assistant", "content": f"[pressed {digit}]"})
+    # "w" = a half-second pause first, so the tone doesn't land on the end of the prompt
+    return await gather(c, "", wait=MENU_WAIT, pre=f'<Play digits="w{digit}"/>')
 
 
 async def hangup_twiml(say: str) -> str:
@@ -495,7 +557,9 @@ def system_prompt(run: Run, c: Candidate) -> str:
         "give a range, several room types or 'it depends', ask for the lowest nightly price for those "
         "dates. "
         f"{hold}Never share payment details. Never invent facts. "
-        'Reply ONLY JSON: {"say":str (<=25 words, natural speech),"done":bool,"available":bool|null,'
+        "If you are hearing an automated phone menu, set press to the key for reservations or the "
+        "front desk (0 for an operator) and say nothing. "
+        'Reply ONLY JSON: {"say":str (<=25 words, natural speech),"press":"digit"|null,"done":bool,"available":bool|null,'
         '"price":number|null,"fees":str|null,"room_type":str|null,"cancellation":str|null,'
         '"check_in_time":str|null,"reference":str|null,"staff_name":str|null}. '
         "Set done=true the moment availability and price are both known, or as soon as they say "
@@ -541,6 +605,39 @@ async def _turn(request: Request, c: Candidate | None):
     heard = (form.get("SpeechResult") or "").strip()
     c.turns += 1
 
+    # Voicemail: nobody to ask. Hang up now; no LLM, no goodbye to a tape.
+    if heard and is_voicemail(heard):
+        c.history.append({"role": "user", "content": heard})
+        c.status = "no_answer"
+        finish(c)
+        return xml("<Response><Hangup/></Response>")
+
+    # Phone menu (a backup: normal calls never get here). Press the key for reservations / front
+    # desk / operator. Not a conversation turn, no LLM. Nothing useful offered: go quiet and keep
+    # listening (the opener went to a machine, so it replays once a person answers); after
+    # MAX_MENU_LISTENS more prompts, press 0.
+    if heard and is_machine(heard) and c.presses < MAX_PRESSES:
+        c.turns -= 1
+        c.opened = False
+        c.history.append({"role": "user", "content": heard})
+        if d := menu_digit(heard):
+            return xml(await press(c, d))
+        c.menu_listens += 1
+        if c.menu_listens > MAX_MENU_LISTENS and re.search(r"\b(press|dial)\b", heard, re.I):
+            return xml(await press(c, "0"))
+        if c.menu_listens <= MAX_MENU_LISTENS + 1:
+            return xml(await gather(c, "", wait=MENU_WAIT))
+
+    # Listen-first: they greeted us (or stayed silent FIRST_WAIT s). Now the opener. No LLM.
+    if not c.opened:
+        c.turns -= 1
+        c.opened = True
+        if heard and not (c.history and c.history[-1]["content"] == heard):
+            c.history.append({"role": "user", "content": heard})
+        op = opener(RUN, c)
+        c.history.append({"role": "assistant", "content": op})   # the LLM now knows what it asked
+        return xml(await gather(c, op))
+
     if not heard and c.holding:
         # On hold: silence is them checking. Keep listening without a word, and don't let the
         # wait eat into MAX_TURNS. After HOLD_CHECKS windows, a polite nudge back to the question.
@@ -585,6 +682,10 @@ async def _turn(request: Request, c: Candidate | None):
         print(f"[llm] {c.name}: {e!r}", file=sys.stderr)
         out = {"say": "Sorry, could you repeat that?", "done": False}
 
+    d = str(out.get("press") or "").strip()
+    if d in DIGITS.values() and c.presses < MAX_PRESSES:   # the LLM spotted a menu the regex missed
+        return xml(await press(c, d))
+
     say = out.get("say") or "Thank you."
     c.history.append({"role": "assistant", "content": say})
     for k in FACT_KEYS:
@@ -616,11 +717,21 @@ async def status(request: Request):
 TW_CALLS = "https://api.twilio.com/2010-04-01/Accounts/{sid}/Calls"
 
 
+async def first_twiml(run: Run, c: Candidate) -> str:
+    """LISTEN_FIRST: just listen, so the front desk's "Good afternoon, Holiday Inn" (or a phone menu)
+    isn't talked over; /turn plays the opener when they stop, or after FIRST_WAIT s of silence.
+    Otherwise the opener plays the instant the call connects."""
+    c.opened, c.presses, c.menu_listens = not LISTEN_FIRST, 0, 0
+    if LISTEN_FIRST:
+        return await gather(c, "", wait=FIRST_WAIT, speech_timeout=FIRST_SPEECH_TIMEOUT)
+    return await gather(c, opener(run, c))
+
+
 async def place_call(run: Run, c: Candidate) -> str:
     c.attempts += 1
     with obs.span("twilio create call", hotel=c.name, attempt=c.attempts) as sp:
         data = {"To": PHONE_OVERRIDE or c.phone, "From": TW_FROM,
-                "Twiml": await gather(c, opener(run, c)),   # inline: no webhook hop before speaking
+                "Twiml": await first_twiml(run, c),         # inline: no webhook hop before we listen/speak
                 "StatusCallback": f"{PUBLIC_URL}/status?c={c.idx}",
                 "StatusCallbackEvent": "completed", "Timeout": "20",
                 "TimeLimit": str(CALL_MAX_SECONDS),         # hard cap, enforced by Twilio
